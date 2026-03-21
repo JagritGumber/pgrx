@@ -47,11 +47,7 @@ fn classify_node(node: &NodeEnum) -> String {
 }
 
 fn protobuf_to_json(result: &ParseResult) -> String {
-    // Serialize the protobuf parse result into a readable JSON format.
-    // pg_query's protobuf types implement Debug, so we use that as a
-    // structured representation for now. In Phase 2 we'll walk the AST
-    // nodes directly for execution.
-    format!("{:#?}", result)
+    serde_json::to_string(result).unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e))
 }
 
 #[cfg(test)]
