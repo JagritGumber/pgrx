@@ -195,8 +195,23 @@ defmodule Wire.Connection do
     <<type, len::32, extra::binary>> = data
     body_len = len - 4
 
-    # If we got extra bytes beyond the body, there are coalesced messages.
-    # Put the excess back by reading only what we need for this message.
+    # Guard against malformed packets where len < 4
+    if body_len < 0 do
+      :gen_tcp.close(socket)
+    else
+      handle_wake_msg(socket, type, body_len, extra)
+    end
+  end
+
+  defp handle_wake_data(socket, partial) when byte_size(partial) < 5 do
+    case :gen_tcp.recv(socket, 5 - byte_size(partial), 30_000) do
+      {:ok, more} -> handle_wake_data(socket, <<partial::binary, more::binary>>)
+      {:error, _} ->
+        :gen_tcp.close(socket)
+    end
+  end
+
+  defp handle_wake_msg(socket, type, body_len, extra) do
     {body, leftover} = if byte_size(extra) >= body_len do
       {binary_part(extra, 0, max(body_len, 0)),
        binary_part(extra, body_len, byte_size(extra) - body_len)}
@@ -220,14 +235,6 @@ defmodule Wire.Connection do
         else
           :ok  # dispatch_with_body already called loop()
         end
-    end
-  end
-
-  defp handle_wake_data(socket, partial) when byte_size(partial) < 5 do
-    case :gen_tcp.recv(socket, 5 - byte_size(partial), 30_000) do
-      {:ok, more} -> handle_wake_data(socket, <<partial::binary, more::binary>>)
-      {:error, _} ->
-        :gen_tcp.close(socket)
     end
   end
 
