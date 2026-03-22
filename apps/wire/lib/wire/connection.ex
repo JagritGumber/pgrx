@@ -123,6 +123,10 @@ defmodule Wire.Connection do
 
 
   # Safe recv that handles errors instead of crashing
+  defp recv_body(socket, len) when len < 0 do
+    :gen_tcp.close(socket)
+    :error
+  end
   defp recv_body(_socket, 0), do: {:ok, <<>>}
   defp recv_body(socket, len) do
     case :gen_tcp.recv(socket, len) do
@@ -355,14 +359,18 @@ defmodule Wire.Connection do
     loop(socket, state)
   end
 
-  defp dispatch_with_body(socket, state, ?C, <<kind, rest::binary>>) do
+  defp dispatch_with_body(socket, state, ?C, <<kind, rest::binary>>) when kind in [?S, ?P] do
     {name, _} = read_cstring(rest)
     state = case kind do
       ?S -> %{state | stmts: Map.delete(state.stmts, name)}
       ?P -> %{state | portals: Map.delete(state.portals, name)}
-      _ -> state
     end
     :gen_tcp.send(socket, <<"3", 4::32>>)
+    loop(socket, state)
+  end
+
+  defp dispatch_with_body(socket, state, ?C, _body) do
+    state = handle_extended_error(socket, "08P01", "invalid Close target type", state)
     loop(socket, state)
   end
 
