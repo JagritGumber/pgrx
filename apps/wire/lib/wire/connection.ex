@@ -415,16 +415,16 @@ defmodule Wire.Connection do
   end
   defp parse_params_list(rest, _n, acc), do: {Enum.reverse(acc), rest}
 
+  # Single-pass parameter substitution to prevent $N-in-values corruption.
+  # A multi-pass approach (replace $3, then $2, then $1) would corrupt SQL
+  # if a parameter value itself contains "$2" — the second pass would
+  # substitute inside the already-replaced value.
   defp substitute_params(sql, params) do
-    params
-    |> Enum.with_index(1)
-    |> Enum.sort_by(fn {_val, idx} -> -idx end)
-    |> Enum.reduce(sql, fn {val, idx}, acc ->
-      placeholder = "$#{idx}"
-      replacement = case val do
+    Regex.replace(~r/\$(\d+)/, sql, fn _match, idx_str ->
+      idx = String.to_integer(idx_str)
+      case Enum.at(params, idx - 1) do
         nil -> "NULL"
         v when is_binary(v) ->
-          # Strip NUL bytes, escape backslashes and single quotes
           cleaned = v
             |> String.replace(<<0>>, "")
             |> String.replace("\\", "\\\\")
@@ -432,7 +432,6 @@ defmodule Wire.Connection do
           "'#{cleaned}'"
         v -> to_string(v)
       end
-      String.replace(acc, placeholder, replacement)
     end)
   end
 
