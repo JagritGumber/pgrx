@@ -10,15 +10,14 @@ defmodule Wire.Connection do
   # --- Startup ---
 
   defp handshake(socket) do
+    # Fix #6: Read type+length in one recv instead of two
     with {:ok, <<len::32>>} <- :gen_tcp.recv(socket, 4),
          {:ok, payload} <- :gen_tcp.recv(socket, len - 4) do
       case payload do
-        # SSL request (magic 80877103)
         <<80_877_103::32>> ->
           :gen_tcp.send(socket, "N")
           handshake(socket)
 
-        # Protocol v3.0
         <<3::16, 0::16, rest::binary>> ->
           params = parse_params(rest)
           Logger.info("connect: #{params["user"]}@#{params["database"]}")
@@ -73,62 +72,77 @@ defmodule Wire.Connection do
     :gen_tcp.send(s, <<"K", 12::32, pid::32, key::32>>)
   end
 
-  defp send_ready(s), do: :gen_tcp.send(s, <<"Z", 5::32, "I">>)
-
   # --- Query Loop ---
+  # Fix #6: Read message type + length in one 5-byte recv
 
   defp loop(socket) do
-    case :gen_tcp.recv(socket, 1) do
-      {:ok, <<"Q">>} -> simple_query(socket); loop(socket)
-      {:ok, <<"X">>} -> :gen_tcp.close(socket)
-      {:ok, <<"P">>} -> skip_msg(socket); :gen_tcp.send(socket, <<"1", 4::32>>); loop(socket)
-      {:ok, <<"B">>} -> skip_msg(socket); :gen_tcp.send(socket, <<"2", 4::32>>); loop(socket)
-      {:ok, <<"D">>} -> skip_msg(socket); loop(socket)
-      {:ok, <<"E">>} -> skip_msg(socket); loop(socket)
-      {:ok, <<"S">>} -> skip_msg(socket); send_ready(socket); loop(socket)
-      {:ok, <<"C">>} -> skip_msg(socket); loop(socket)
-      {:ok, <<"H">>} -> skip_msg(socket); loop(socket)
-      {:ok, _} -> skip_msg(socket); loop(socket)
+    case :gen_tcp.recv(socket, 5) do
+      {:ok, <<"Q", len::32>>} ->
+        simple_query(socket, len - 4)
+        loop(socket)
+
+      {:ok, <<"X", _::32>>} ->
+        :gen_tcp.close(socket)
+
+      {:ok, <<"P", len::32>>} ->
+        if len > 4, do: :gen_tcp.recv(socket, len - 4)
+        :gen_tcp.send(socket, <<"1", 4::32>>)
+        loop(socket)
+
+      {:ok, <<"B", len::32>>} ->
+        if len > 4, do: :gen_tcp.recv(socket, len - 4)
+        :gen_tcp.send(socket, <<"2", 4::32>>)
+        loop(socket)
+
+      {:ok, <<"S", len::32>>} ->
+        if len > 4, do: :gen_tcp.recv(socket, len - 4)
+        :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
+        loop(socket)
+
+      {:ok, <<_, len::32>>} ->
+        if len > 4, do: :gen_tcp.recv(socket, len - 4)
+        loop(socket)
+
       {:error, :closed} -> :ok
       {:error, r} -> Logger.error("Connection: #{inspect(r)}")
     end
   end
 
-  defp skip_msg(socket) do
-    {:ok, <<len::32>>} = :gen_tcp.recv(socket, 4)
-    if len > 4, do: :gen_tcp.recv(socket, len - 4)
-  end
-
   # --- Simple Query ---
 
-  defp simple_query(socket) do
-    {:ok, <<len::32>>} = :gen_tcp.recv(socket, 4)
-    {:ok, data} = :gen_tcp.recv(socket, len - 4)
+  defp simple_query(socket, body_len) do
+    {:ok, data} = :gen_tcp.recv(socket, body_len)
     sql = String.trim_trailing(data, <<0>>)
-    Logger.debug("Q: #{sql}")
+
+    # Fix #5: Remove Logger.debug from hot path
 
     case run_query(String.trim(sql)) do
       {:rows, cols, rows, tag} ->
-        send_row_desc(socket, cols)
-        Enum.each(rows, &send_data_row(socket, &1))
-        send_complete(socket, tag)
+        # Fix #2: Buffer entire response and send in one write
+        buf = [
+          encode_row_desc(cols),
+          Enum.map(rows, &encode_data_row/1),
+          encode_complete(tag),
+          <<"Z", 5::32, "I">>
+        ]
+        :gen_tcp.send(socket, buf)
 
       {:command, tag} ->
-        send_complete(socket, tag)
+        buf = [encode_complete(tag), <<"Z", 5::32, "I">>]
+        :gen_tcp.send(socket, buf)
 
       {:error, msg} ->
-        send_error(socket, "42601", msg)
+        buf = [encode_error("42601", msg), <<"Z", 5::32, "I">>]
+        :gen_tcp.send(socket, buf)
     end
-
-    send_ready(socket)
   end
 
   # --- Query dispatch — routes to Rust engine via NIF ---
 
   defp run_query(sql) do
-    normalized = sql |> String.downcase() |> String.trim_trailing(";") |> String.trim()
+    # Fix #6b: Correct normalization order (trim whitespace before trimming semicolon)
+    normalized = sql |> String.downcase() |> String.trim() |> String.trim_trailing(";") |> String.trim()
 
-    # Handle built-in functions that need BEAM-side responses
     cond do
       normalized == "select version()" ->
         v = "pgrx 0.1.0 on BEAM/OTP 27 + Rust — PostgreSQL 18.0 compatible"
@@ -151,15 +165,7 @@ defmodule Wire.Connection do
             if columns == [] and rows == [] do
               {:command, tag}
             else
-              text_rows =
-                Enum.map(rows, fn row ->
-                  Enum.map(row, fn
-                    nil -> nil
-                    val -> val
-                  end)
-                end)
-
-              {:rows, columns, text_rows, tag}
+              {:rows, columns, rows, tag}
             end
 
           {:error, msg} ->
@@ -168,19 +174,19 @@ defmodule Wire.Connection do
     end
   end
 
-  # --- Response Encoding ---
+  # --- Response Encoding (returns iodata, does NOT send) ---
 
-  defp send_row_desc(s, cols) do
+  defp encode_row_desc(cols) do
     fields =
       for {name, oid} <- cols, into: <<>> do
         <<name::binary, 0, 0::32, 0::16, oid::32, -1::signed-16, -1::signed-32, 0::16>>
       end
 
     payload = <<length(cols)::16, fields::binary>>
-    :gen_tcp.send(s, <<"T", byte_size(payload) + 4::32, payload::binary>>)
+    <<"T", byte_size(payload) + 4::32, payload::binary>>
   end
 
-  defp send_data_row(s, vals) do
+  defp encode_data_row(vals) do
     fields =
       for v <- vals, into: <<>> do
         case v do
@@ -192,16 +198,22 @@ defmodule Wire.Connection do
       end
 
     payload = <<length(vals)::16, fields::binary>>
-    :gen_tcp.send(s, <<"D", byte_size(payload) + 4::32, payload::binary>>)
+    <<"D", byte_size(payload) + 4::32, payload::binary>>
   end
 
-  defp send_complete(s, tag) do
+  defp encode_complete(tag) do
     payload = <<tag::binary, 0>>
-    :gen_tcp.send(s, <<"C", byte_size(payload) + 4::32, payload::binary>>)
+    <<"C", byte_size(payload) + 4::32, payload::binary>>
+  end
+
+  defp encode_error(code, msg) do
+    payload = <<"S", "ERROR", 0, "V", "ERROR", 0, "C", code::binary, 0, "M", msg::binary, 0, 0>>
+    <<"E", byte_size(payload) + 4::32, payload::binary>>
   end
 
   defp send_error(s, code, msg) do
-    payload = <<"S", "ERROR", 0, "V", "ERROR", 0, "C", code::binary, 0, "M", msg::binary, 0, 0>>
-    :gen_tcp.send(s, <<"E", byte_size(payload) + 4::32, payload::binary>>)
+    :gen_tcp.send(s, encode_error(code, msg))
   end
+
+  defp send_ready(s), do: :gen_tcp.send(s, <<"Z", 5::32, "I">>)
 end
