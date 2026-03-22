@@ -14,6 +14,143 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
+// ── JoinContext: multi-table column resolution ───────────────────────
+
+/// A table source in a multi-table join context.
+struct JoinSource {
+    alias: String,
+    table_name: String,
+    #[allow(dead_code)] // needed for future cross-schema joins
+    schema: String,
+    table_def: Table,
+    col_offset: usize,
+}
+
+/// Context for column resolution across potentially multiple tables.
+struct JoinContext {
+    sources: Vec<JoinSource>,
+    total_columns: usize,
+}
+
+impl JoinContext {
+    /// Build a single-table context (backward compat for DELETE/UPDATE).
+    fn single(schema: &str, table_name: &str, table_def: Table) -> Self {
+        let ncols = table_def.columns.len();
+        JoinContext {
+            sources: vec![JoinSource {
+                alias: table_name.to_string(),
+                table_name: table_name.to_string(),
+                schema: schema.to_string(),
+                table_def,
+                col_offset: 0,
+            }],
+            total_columns: ncols,
+        }
+    }
+}
+
+/// Extract string fields from a ColumnRef.
+fn extract_string_fields(cref: &pg_query::protobuf::ColumnRef) -> Vec<String> {
+    cref.fields
+        .iter()
+        .filter_map(|f| f.node.as_ref())
+        .filter_map(|n| {
+            if let NodeEnum::String(s) = n {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Resolve a column reference to an index into the joined row.
+fn resolve_column(
+    cref: &pg_query::protobuf::ColumnRef,
+    ctx: &JoinContext,
+) -> Result<usize, String> {
+    let fields = extract_string_fields(cref);
+
+    match fields.len() {
+        1 => {
+            // Unqualified: search all sources, error if ambiguous
+            let col_name = &fields[0];
+            let mut found = Vec::new();
+            for src in &ctx.sources {
+                if let Some(pos) = src.table_def.columns.iter().position(|c| c.name == *col_name) {
+                    found.push(src.col_offset + pos);
+                }
+            }
+            match found.len() {
+                0 => Err(format!("column \"{}\" does not exist", col_name)),
+                1 => Ok(found[0]),
+                _ => Err(format!(
+                    "column reference \"{}\" is ambiguous",
+                    col_name
+                )),
+            }
+        }
+        2 => {
+            // Qualified: qualifier.column
+            let (qualifier, col_name) = (&fields[0], &fields[1]);
+            // First try exact alias match, then table_name match with ambiguity check
+            let matches: Vec<_> = ctx.sources.iter()
+                .filter(|s| s.alias == *qualifier)
+                .collect();
+            let src = if matches.len() == 1 {
+                matches[0]
+            } else if matches.is_empty() {
+                // Fall back to table_name match
+                let by_name: Vec<_> = ctx.sources.iter()
+                    .filter(|s| s.table_name == *qualifier)
+                    .collect();
+                match by_name.len() {
+                    0 => return Err(format!(
+                        "missing FROM-clause entry for table \"{}\"", qualifier
+                    )),
+                    1 => by_name[0],
+                    _ => return Err(format!(
+                        "table reference \"{}\" is ambiguous", qualifier
+                    )),
+                }
+            } else {
+                return Err(format!(
+                    "table reference \"{}\" is ambiguous", qualifier
+                ));
+            };
+            let pos = src
+                .table_def
+                .columns
+                .iter()
+                .position(|c| c.name == *col_name)
+                .ok_or_else(|| {
+                    format!("column \"{}.{}\" does not exist", qualifier, col_name)
+                })?;
+            Ok(src.col_offset + pos)
+        }
+        _ => Err("unsupported column reference".into()),
+    }
+}
+
+/// Get the type OID for a column index in a JoinContext.
+fn column_type_oid(idx: usize, ctx: &JoinContext) -> Result<i32, String> {
+    for src in &ctx.sources {
+        let end = src.col_offset + src.table_def.columns.len();
+        if idx >= src.col_offset && idx < end {
+            return Ok(src.table_def.columns[idx - src.col_offset].type_oid.oid());
+        }
+    }
+    // Fallback for expression columns or empty context
+    if ctx.sources.is_empty() {
+        Ok(TypeOid::Text.oid())
+    } else {
+        Err(format!(
+            "internal error: column index {} not found in any source (total: {})",
+            idx, ctx.total_columns
+        ))
+    }
+}
+
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
     let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
 
@@ -424,28 +561,20 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
     }
 }
 
-fn eval_expr(node: &NodeEnum, row: &[Value], table: &Table) -> Result<Value, String> {
+fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value, String> {
     match node {
         NodeEnum::ColumnRef(cref) => {
-            let col_name = cref
-                .fields
-                .iter()
-                .filter_map(|f| f.node.as_ref())
-                .filter_map(|n| {
-                    if let NodeEnum::String(s) = n {
-                        Some(s.sval.clone())
-                    } else {
-                        None
-                    }
-                })
-                .last()
-                .ok_or("empty ColumnRef")?;
-            let idx = table
-                .columns
-                .iter()
-                .position(|c| c.name == col_name)
-                .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
-            Ok(row.get(idx).cloned().unwrap_or(Value::Null))
+            let idx = resolve_column(cref, ctx)?;
+            if idx < row.len() {
+                Ok(row[idx].clone())
+            } else if ctx.total_columns == 0 {
+                Ok(Value::Null) // no-FROM context (SELECT 1)
+            } else {
+                Err(format!(
+                    "internal error: column index {} out of range for row of width {}",
+                    idx, row.len()
+                ))
+            }
         }
         NodeEnum::AConst(ac) => {
             if ac.isnull {
@@ -480,17 +609,17 @@ fn eval_expr(node: &NodeEnum, row: &[Value], table: &Table) -> Result<Value, Str
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
-            eval_expr(inner, row, table)
+            eval_expr(inner, row, ctx)
         }
-        NodeEnum::AExpr(expr) => eval_a_expr(expr, row, table),
-        NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, table),
+        NodeEnum::AExpr(expr) => eval_a_expr(expr, row, ctx),
+        NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, ctx),
         NodeEnum::NullTest(nt) => {
             let inner = nt
                 .arg
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("NullTest missing arg")?;
-            let val = eval_expr(inner, row, table)?;
+            let val = eval_expr(inner, row, ctx)?;
             let is_null = matches!(val, Value::Null);
             if nt.nulltesttype == pg_query::protobuf::NullTestType::IsNull as i32 {
                 Ok(Value::Bool(is_null))
@@ -498,7 +627,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], table: &Table) -> Result<Value, Str
                 Ok(Value::Bool(!is_null))
             }
         }
-        NodeEnum::FuncCall(fc) => eval_func_call(fc, row, table),
+        NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx),
         _ => Err(format!(
             "unsupported expression node: {:?}",
             std::mem::discriminant(node)
@@ -509,7 +638,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], table: &Table) -> Result<Value, Str
 fn eval_a_expr(
     expr: &pg_query::protobuf::AExpr,
     row: &[Value],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Value, String> {
     let op = extract_op_name(&expr.name)?;
 
@@ -520,7 +649,7 @@ fn eval_a_expr(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or("unary - missing operand")?;
-        return match eval_expr(right, row, table)? {
+        return match eval_expr(right, row, ctx)? {
             Value::Int(n) => Ok(Value::Int(
                 n.checked_neg().ok_or("integer out of range")?,
             )),
@@ -541,8 +670,8 @@ fn eval_a_expr(
         .and_then(|n| n.node.as_ref())
         .ok_or("A_Expr missing right operand")?;
 
-    let left = eval_expr(left_node, row, table)?;
-    let right = eval_expr(right_node, row, table)?;
+    let left = eval_expr(left_node, row, ctx)?;
+    let right = eval_expr(right_node, row, ctx)?;
 
     // String concatenation
     if op == "||" {
@@ -582,14 +711,14 @@ fn eval_a_expr(
 fn eval_bool_expr(
     bexpr: &pg_query::protobuf::BoolExpr,
     row: &[Value],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Value, String> {
     let boolop = bexpr.boolop;
     if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
         let mut has_null = false;
         for arg in &bexpr.args {
             let inner = arg.node.as_ref().ok_or("BoolExpr: missing arg")?;
-            match eval_expr(inner, row, table)? {
+            match eval_expr(inner, row, ctx)? {
                 Value::Bool(false) => return Ok(Value::Bool(false)),
                 Value::Null => has_null = true,
                 Value::Bool(true) => {}
@@ -601,7 +730,7 @@ fn eval_bool_expr(
         let mut has_null = false;
         for arg in &bexpr.args {
             let inner = arg.node.as_ref().ok_or("BoolExpr: missing arg")?;
-            match eval_expr(inner, row, table)? {
+            match eval_expr(inner, row, ctx)? {
                 Value::Bool(true) => return Ok(Value::Bool(true)),
                 Value::Null => has_null = true,
                 Value::Bool(false) => {}
@@ -615,7 +744,7 @@ fn eval_bool_expr(
             .first()
             .and_then(|a| a.node.as_ref())
             .ok_or("NOT missing arg")?;
-        match eval_expr(inner, row, table)? {
+        match eval_expr(inner, row, ctx)? {
             Value::Bool(b) => Ok(Value::Bool(!b)),
             Value::Null => Ok(Value::Null),
             other => Err(format!("NOT expects bool, got {:?}", other)),
@@ -677,7 +806,7 @@ fn eval_arithmetic(op: &str, left: &Value, right: &Value) -> Result<Value, Strin
 fn eval_func_call(
     fc: &pg_query::protobuf::FuncCall,
     row: &[Value],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Value, String> {
     let name = extract_func_name(fc);
 
@@ -690,7 +819,7 @@ fn eval_func_call(
             eval_expr(
                 a.node.as_ref().ok_or("FuncCall: missing arg")?,
                 row,
-                table,
+                ctx,
             )
         })
         .collect::<Result<_, _>>()?;
@@ -740,11 +869,11 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
 fn eval_where(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
     row: &[Value],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<bool, String> {
     match where_clause {
         Some(wc) => match wc.node.as_ref() {
-            Some(expr) => match eval_expr(expr, row, table)? {
+            Some(expr) => match eval_expr(expr, row, ctx)? {
                 Value::Bool(b) => Ok(b),
                 Value::Null => Ok(false), // NULL in WHERE filters out the row
                 _ => Err("WHERE clause must return boolean".into()),
@@ -817,18 +946,200 @@ fn query_has_aggregates(select: &pg_query::protobuf::SelectStmt) -> bool {
     })
 }
 
-fn extract_from_table(node: Option<&NodeEnum>) -> Result<(String, String), String> {
+// ── FROM clause execution (handles single table, JOINs, implicit joins) ──
+
+fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), String> {
     match node {
-        Some(NodeEnum::RangeVar(rv)) => {
+        NodeEnum::RangeVar(rv) => {
+            let alias = rv
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| rv.relname.clone());
             let schema = if rv.schemaname.is_empty() {
-                "public".to_string()
+                "public"
             } else {
-                rv.schemaname.clone()
+                &rv.schemaname
             };
-            Ok((schema, rv.relname.clone()))
+            let table_def = catalog::get_table(schema, &rv.relname)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+            let rows = storage::scan(schema, &rv.relname)?;
+            let ncols = table_def.columns.len();
+            let ctx = JoinContext {
+                sources: vec![JoinSource {
+                    alias,
+                    table_name: rv.relname.clone(),
+                    schema: schema.to_string(),
+                    table_def,
+                    col_offset: 0,
+                }],
+                total_columns: ncols,
+            };
+            Ok((rows, ctx))
         }
-        _ => Err("unsupported FROM clause".into()),
+        NodeEnum::JoinExpr(je) => {
+            let left_node = je
+                .larg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or("JOIN missing left")?;
+            let right_node = je
+                .rarg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or("JOIN missing right")?;
+            let (left_rows, left_ctx) = execute_from(left_node)?;
+            let (right_rows, right_ctx) = execute_from(right_node)?;
+
+            // Merge contexts — shift right offsets
+            let left_width = left_ctx.total_columns;
+            let right_width = right_ctx.total_columns;
+            let mut sources = left_ctx.sources;
+            for mut src in right_ctx.sources {
+                src.col_offset += left_width;
+                sources.push(src);
+            }
+            let merged = JoinContext {
+                total_columns: left_width + right_width,
+                sources,
+            };
+
+            // USING and NATURAL JOIN not yet supported
+            if !je.using_clause.is_empty() {
+                return Err("JOIN ... USING is not yet supported; use JOIN ... ON instead".into());
+            }
+            if je.is_natural {
+                return Err("NATURAL JOIN is not yet supported; use JOIN ... ON instead".into());
+            }
+
+            let quals = je.quals.as_ref().and_then(|n| n.node.as_ref());
+
+            let result = nested_loop_join(
+                &left_rows,
+                &right_rows,
+                je.jointype,
+                quals,
+                &merged,
+                left_width,
+                right_width,
+            )?;
+
+            Ok((result, merged))
+        }
+        _ => Err("unsupported FROM clause node".into()),
     }
+}
+
+fn nested_loop_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    join_type: i32,
+    quals: Option<&NodeEnum>,
+    ctx: &JoinContext,
+    left_width: usize,
+    right_width: usize,
+) -> Result<Vec<Vec<Value>>, String> {
+    let null_right = vec![Value::Null; right_width];
+    let null_left = vec![Value::Null; left_width];
+    let mut result = Vec::with_capacity(left_rows.len());
+    let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
+        || join_type == pg_query::protobuf::JoinType::Undefined as i32;
+    let is_left = join_type == pg_query::protobuf::JoinType::JoinLeft as i32;
+    let is_right = join_type == pg_query::protobuf::JoinType::JoinRight as i32;
+    let is_full = join_type == pg_query::protobuf::JoinType::JoinFull as i32;
+
+    if !is_inner && !is_left && !is_right && !is_full {
+        return Err(format!("unsupported JOIN type: {}", join_type));
+    }
+    let mut right_matched = if is_right || is_full {
+        vec![false; right_rows.len()]
+    } else {
+        Vec::new()
+    };
+
+    for left in left_rows {
+        let mut left_matched = false;
+        for (ri, right) in right_rows.iter().enumerate() {
+            let mut combined = Vec::with_capacity(left_width + right_width);
+            combined.extend_from_slice(left);
+            combined.extend_from_slice(right);
+
+            let matches = match quals {
+                Some(q) => matches!(eval_expr(q, &combined, ctx)?, Value::Bool(true)),
+                None => true, // CROSS JOIN
+            };
+
+            if matches {
+                left_matched = true;
+                if !right_matched.is_empty() {
+                    right_matched[ri] = true;
+                }
+                result.push(combined);
+            }
+        }
+
+        if !left_matched && (is_left || is_full) {
+            let mut row = left.clone();
+            row.extend_from_slice(&null_right);
+            result.push(row);
+        }
+    }
+
+    if is_right || is_full {
+        for (ri, right) in right_rows.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut row = null_left.clone();
+                row.extend_from_slice(right);
+                result.push(row);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Execute the full FROM clause, handling multiple comma-separated tables.
+fn execute_from_clause(
+    from_clause: &[pg_query::protobuf::Node],
+) -> Result<(Vec<Vec<Value>>, JoinContext), String> {
+    let first = from_clause
+        .first()
+        .and_then(|n| n.node.as_ref())
+        .ok_or("missing FROM")?;
+    let (mut rows, mut ctx) = execute_from(first)?;
+
+    // Implicit cross join for FROM a, b, c ...
+    for from_node in &from_clause[1..] {
+        let node = from_node.node.as_ref().ok_or("missing FROM node")?;
+        let (right_rows, right_ctx) = execute_from(node)?;
+        let left_width = ctx.total_columns;
+        let right_width = right_ctx.total_columns;
+
+        // Merge contexts
+        let mut sources = ctx.sources;
+        for mut src in right_ctx.sources {
+            src.col_offset += left_width;
+            sources.push(src);
+        }
+        ctx = JoinContext {
+            total_columns: left_width + right_width,
+            sources,
+        };
+
+        // Cross product
+        let mut new_rows = Vec::with_capacity(rows.len() * right_rows.len());
+        for left in &rows {
+            for right in &right_rows {
+                let mut combined = Vec::with_capacity(left_width + right_width);
+                combined.extend_from_slice(left);
+                combined.extend_from_slice(right);
+                new_rows.push(combined);
+            }
+        }
+        rows = new_rows;
+    }
+
+    Ok((rows, ctx))
 }
 
 // ── SELECT target resolution ──────────────────────────────────────────
@@ -840,7 +1151,7 @@ enum SelectTarget {
 
 fn resolve_targets(
     select: &pg_query::protobuf::SelectStmt,
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Vec<SelectTarget>, String> {
     let mut targets = Vec::new();
 
@@ -849,35 +1160,51 @@ fn resolve_targets(
             let val_node = rt.val.as_ref().and_then(|v| v.node.as_ref());
             match val_node {
                 Some(NodeEnum::ColumnRef(cref)) => {
-                    let col_name = cref
+                    // Check for star variants
+                    let has_star = cref
                         .fields
                         .iter()
-                        .filter_map(|f| f.node.as_ref())
-                        .filter_map(|n| match n {
-                            NodeEnum::String(s) => Some(s.sval.clone()),
-                            NodeEnum::AStar(_) => Some("*".to_string()),
-                            _ => None,
-                        })
-                        .last()
-                        .unwrap_or_default();
+                        .any(|f| matches!(f.node.as_ref(), Some(NodeEnum::AStar(_))));
 
-                    if col_name == "*" {
-                        for (i, col) in table.columns.iter().enumerate() {
-                            targets.push(SelectTarget::Column {
-                                name: col.name.clone(),
-                                idx: i,
-                            });
+                    if has_star {
+                        // Check if qualified star (e.g., u.*)
+                        let string_fields = extract_string_fields(cref);
+                        if string_fields.is_empty() {
+                            // Unqualified *: expand all sources
+                            for src in &ctx.sources {
+                                for (i, col) in src.table_def.columns.iter().enumerate() {
+                                    targets.push(SelectTarget::Column {
+                                        name: col.name.clone(),
+                                        idx: src.col_offset + i,
+                                    });
+                                }
+                            }
+                        } else {
+                            // Qualified star: e.g., u.*
+                            let qualifier = &string_fields[0];
+                            let matches: Vec<_> = ctx.sources.iter()
+                                .filter(|s| s.alias == *qualifier || s.table_name == *qualifier)
+                                .collect();
+                            let src = match matches.len() {
+                                0 => return Err(format!(
+                                    "missing FROM-clause entry for table \"{}\"", qualifier
+                                )),
+                                1 => matches[0],
+                                _ => return Err(format!(
+                                    "table reference \"{}\" is ambiguous", qualifier
+                                )),
+                            };
+                            for (i, col) in src.table_def.columns.iter().enumerate() {
+                                targets.push(SelectTarget::Column {
+                                    name: col.name.clone(),
+                                    idx: src.col_offset + i,
+                                });
+                            }
                         }
                     } else {
-                        let idx = table
-                            .columns
-                            .iter()
-                            .position(|c| c.name == col_name)
-                            .ok_or_else(|| {
-                                format!("column \"{}\" does not exist", col_name)
-                            })?;
+                        let idx = resolve_column(cref, ctx)?;
                         let alias = if rt.name.is_empty() {
-                            col_name
+                            extract_col_name(cref)
                         } else {
                             rt.name.clone()
                         };
@@ -917,29 +1244,25 @@ fn exec_select(
         return exec_select_no_from(select);
     }
 
-    let from = select.from_clause.first().ok_or("missing FROM")?;
-    let (schema, table_name) = extract_from_table(from.node.as_ref())?;
-    let table_def = catalog::get_table(&schema, &table_name)
-        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    // Execute FROM clause (handles single table, JOINs, and implicit joins)
+    let (all_rows, ctx) = execute_from_clause(&select.from_clause)?;
 
-    let all_rows = storage::scan(&schema, &table_name)?;
-
-    // WHERE filter (propagates errors instead of silently excluding rows)
+    // WHERE filter
     let mut rows: Vec<Vec<Value>> = Vec::new();
     for row in all_rows {
-        if eval_where(&select.where_clause, &row, &table_def)? {
+        if eval_where(&select.where_clause, &row, &ctx)? {
             rows.push(row);
         }
     }
 
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
-        return exec_select_aggregate(select, &table_def, rows);
+        return exec_select_aggregate(select, &ctx, rows);
     }
 
     // ORDER BY (on full rows before projection)
     if !select.sort_clause.is_empty() {
-        let sort_keys = resolve_sort_keys(&select.sort_clause, &table_def, select)?;
+        let sort_keys = resolve_sort_keys(&select.sort_clause, &ctx, select)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
     }
 
@@ -963,35 +1286,33 @@ fn exec_select(
     }
 
     // Resolve targets and project
-    let targets = resolve_targets(select, &table_def)?;
+    let targets = resolve_targets(select, &ctx)?;
     let columns: Vec<(String, i32)> = targets
         .iter()
         .map(|t| match t {
             SelectTarget::Column { name, idx } => {
-                (name.clone(), table_def.columns[*idx].type_oid.oid())
+                Ok((name.clone(), column_type_oid(*idx, &ctx)?))
             }
-            SelectTarget::Expr { name, .. } => (name.clone(), TypeOid::Text.oid()),
+            SelectTarget::Expr { name, .. } => Ok((name.clone(), TypeOid::Text.oid())),
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
-    let result_rows: Vec<Vec<Option<String>>> = rows
-        .iter()
-        .map(|row| {
-            targets
-                .iter()
-                .map(|t| match t {
-                    SelectTarget::Column { idx, .. } => {
-                        row.get(*idx).and_then(|v| v.to_text())
-                    }
-                    SelectTarget::Expr { expr, .. } => {
-                        eval_expr(expr, row, &table_def)
-                            .ok()
-                            .and_then(|v| v.to_text())
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+    for row in &rows {
+        let mut result_row = Vec::new();
+        for t in &targets {
+            let cell = match t {
+                SelectTarget::Column { idx, .. } => {
+                    row.get(*idx).and_then(|v| v.to_text())
+                }
+                SelectTarget::Expr { expr, .. } => {
+                    eval_expr(expr, row, &ctx)?.to_text()
+                }
+            };
+            result_row.push(cell);
+        }
+        result_rows.push(result_row);
+    }
 
     let count = result_rows.len();
     Ok(QueryResult {
@@ -1004,10 +1325,9 @@ fn exec_select(
 fn exec_select_no_from(
     select: &pg_query::protobuf::SelectStmt,
 ) -> Result<QueryResult, String> {
-    let dummy_table = Table {
-        name: String::new(),
-        schema: String::new(),
-        columns: vec![],
+    let dummy_ctx = JoinContext {
+        sources: vec![],
+        total_columns: 0,
     };
     let mut columns = Vec::new();
     let mut row = Vec::new();
@@ -1020,8 +1340,7 @@ fn exec_select_no_from(
                 rt.name.clone()
             };
             let val = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-                Some(expr) => eval_expr(expr, &[], &dummy_table)
-                    .unwrap_or(Value::Null),
+                Some(expr) => eval_expr(expr, &[], &dummy_ctx)?,
                 None => Value::Null,
             };
             columns.push((alias, TypeOid::Text.oid()));
@@ -1046,31 +1365,21 @@ struct SortKey {
 
 fn resolve_sort_keys(
     sort_clause: &[pg_query::protobuf::Node],
-    table: &Table,
+    ctx: &JoinContext,
     select: &pg_query::protobuf::SelectStmt,
 ) -> Result<Vec<SortKey>, String> {
     let mut keys = Vec::new();
     for snode in sort_clause {
         if let Some(NodeEnum::SortBy(sb)) = snode.node.as_ref() {
             let col_idx = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
-                Some(NodeEnum::ColumnRef(cref)) => {
-                    let name = extract_col_name(cref);
-                    table
-                        .columns
-                        .iter()
-                        .position(|c| c.name == name)
-                        .ok_or_else(|| {
-                            format!("column \"{}\" does not exist", name)
-                        })?
-                }
+                Some(NodeEnum::ColumnRef(cref)) => resolve_column(cref, ctx)?,
                 Some(NodeEnum::AConst(ac)) => {
                     // Ordinal: ORDER BY 1 means first column in target list
                     let ordinal = match &ac.val {
                         Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize,
                         _ => return Err("invalid ORDER BY ordinal".into()),
                     };
-                    // Map ordinal to actual table column index via target list
-                    resolve_ordinal_to_col_idx(ordinal, select, table)?
+                    resolve_ordinal_to_col_idx(ordinal, select, ctx)?
                 }
                 _ => return Err("unsupported ORDER BY expression".into()),
             };
@@ -1096,7 +1405,7 @@ fn resolve_sort_keys(
 fn resolve_ordinal_to_col_idx(
     ordinal: usize,
     select: &pg_query::protobuf::SelectStmt,
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<usize, String> {
     if ordinal == 0 || ordinal > select.target_list.len() {
         return Err(format!("ORDER BY position {} is not in select list", ordinal));
@@ -1104,12 +1413,7 @@ fn resolve_ordinal_to_col_idx(
     let target = &select.target_list[ordinal - 1];
     if let Some(NodeEnum::ResTarget(rt)) = target.node.as_ref() {
         if let Some(NodeEnum::ColumnRef(cref)) = rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-            let name = extract_col_name(cref);
-            return table
-                .columns
-                .iter()
-                .position(|c| c.name == name)
-                .ok_or_else(|| format!("column \"{}\" does not exist", name));
+            return resolve_column(cref, ctx);
         }
     }
     Err("ORDER BY ordinal must reference a column".into())
@@ -1117,8 +1421,8 @@ fn resolve_ordinal_to_col_idx(
 
 fn compare_rows(keys: &[SortKey], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     for k in keys {
-        let va = &a[k.col_idx];
-        let vb = &b[k.col_idx];
+        let va = a.get(k.col_idx).unwrap_or(&Value::Null);
+        let vb = b.get(k.col_idx).unwrap_or(&Value::Null);
         let ord = match (va, vb) {
             (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
             (Value::Null, _) => {
@@ -1157,10 +1461,10 @@ fn eval_const_i64(node: Option<&NodeEnum>) -> Option<i64> {
 
 fn exec_select_aggregate(
     select: &pg_query::protobuf::SelectStmt,
-    table: &Table,
+    ctx: &JoinContext,
     rows: Vec<Vec<Value>>,
 ) -> Result<QueryResult, String> {
-    let group_col_indices = resolve_group_columns(&select.group_clause, table)?;
+    let group_col_indices = resolve_group_columns(&select.group_clause, ctx)?;
 
     // Group rows (use Vec to maintain insertion order, HashMap for O(1) lookup)
     let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
@@ -1198,7 +1502,8 @@ fn exec_select_aggregate(
                     Some(NodeEnum::FuncCall(fc)) => {
                         let name = extract_func_name(fc);
                         if is_aggregate(&name) {
-                            let agg_val = compute_aggregate(&name, fc, group_rows, table)?;
+                            let agg_val =
+                                compute_aggregate(&name, fc, group_rows, ctx)?;
                             if !columns_built {
                                 let alias = if rt.name.is_empty() {
                                     name.clone()
@@ -1221,16 +1526,10 @@ fn exec_select_aggregate(
                         }
                     }
                     Some(NodeEnum::ColumnRef(cref)) => {
-                        let col_name = extract_col_name(cref);
-                        let col_idx = table
-                            .columns
-                            .iter()
-                            .position(|c| c.name == col_name)
-                            .ok_or_else(|| {
-                                format!("column \"{}\" does not exist", col_name)
-                            })?;
+                        let col_idx = resolve_column(cref, ctx)?;
 
                         if !group_col_indices.contains(&col_idx) {
+                            let col_name = extract_col_name(cref);
                             return Err(format!(
                                 "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
                                 col_name
@@ -1239,11 +1538,12 @@ fn exec_select_aggregate(
 
                         if !columns_built {
                             let alias = if rt.name.is_empty() {
-                                col_name
+                                extract_col_name(cref)
                             } else {
                                 rt.name.clone()
                             };
-                            result_columns.push((alias, table.columns[col_idx].type_oid.oid()));
+                            result_columns
+                                .push((alias, column_type_oid(col_idx, ctx)?));
                         }
 
                         let key_pos = group_col_indices
@@ -1270,7 +1570,7 @@ fn exec_select_aggregate(
         if let Some(having_expr) = having_node.node.as_ref() {
             let mut filtered = Vec::new();
             for (i, (_, group_rows)) in groups.iter().enumerate() {
-                if eval_having(having_expr, group_rows, table)? {
+                if eval_having(having_expr, group_rows, ctx)? {
                     filtered.push(result_rows[i].clone());
                 }
             }
@@ -1287,17 +1587,12 @@ fn exec_select_aggregate(
 
 fn resolve_group_columns(
     group_clause: &[pg_query::protobuf::Node],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Vec<usize>, String> {
     let mut indices = Vec::new();
     for node in group_clause {
         if let Some(NodeEnum::ColumnRef(cref)) = node.node.as_ref() {
-            let col_name = extract_col_name(cref);
-            let idx = table
-                .columns
-                .iter()
-                .position(|c| c.name == col_name)
-                .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
+            let idx = resolve_column(cref, ctx)?;
             indices.push(idx);
         }
     }
@@ -1308,7 +1603,7 @@ fn compute_aggregate(
     name: &str,
     fc: &pg_query::protobuf::FuncCall,
     rows: &[Vec<Value>],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Value, String> {
     match name {
         "count" => {
@@ -1320,13 +1615,14 @@ fn compute_aggregate(
                     .first()
                     .and_then(|a| a.node.as_ref())
                     .ok_or("COUNT requires argument")?;
-                let count = rows
-                    .iter()
-                    .filter(|row| {
-                        !matches!(eval_expr(arg, row, table), Ok(Value::Null) | Err(_))
-                    })
-                    .count();
-                Ok(Value::Int(count as i64))
+                let mut count: i64 = 0;
+                for row in rows {
+                    match eval_expr(arg, row, ctx)? {
+                        Value::Null => {} // COUNT(col) skips NULLs
+                        _ => count += 1,
+                    }
+                }
+                Ok(Value::Int(count))
             }
         }
         "sum" => {
@@ -1340,7 +1636,7 @@ fn compute_aggregate(
             let mut is_float = false;
             let mut has_val = false;
             for row in rows {
-                match eval_expr(arg, row, table)? {
+                match eval_expr(arg, row, ctx)? {
                     Value::Int(n) => {
                         si = si.checked_add(n).ok_or("integer out of range")?;
                         has_val = true;
@@ -1372,7 +1668,7 @@ fn compute_aggregate(
             let mut sum: f64 = 0.0;
             let mut count: i64 = 0;
             for row in rows {
-                match eval_expr(arg, row, table)? {
+                match eval_expr(arg, row, ctx)? {
                     Value::Int(n) => {
                         sum += n as f64;
                         count += 1;
@@ -1399,7 +1695,7 @@ fn compute_aggregate(
                 .ok_or("MIN requires argument")?;
             let mut result: Option<Value> = None;
             for row in rows {
-                let v = eval_expr(arg, row, table)?;
+                let v = eval_expr(arg, row, ctx)?;
                 if matches!(v, Value::Null) {
                     continue;
                 }
@@ -1424,7 +1720,7 @@ fn compute_aggregate(
                 .ok_or("MAX requires argument")?;
             let mut result: Option<Value> = None;
             for row in rows {
-                let v = eval_expr(arg, row, table)?;
+                let v = eval_expr(arg, row, ctx)?;
                 if matches!(v, Value::Null) {
                     continue;
                 }
@@ -1448,22 +1744,22 @@ fn compute_aggregate(
 fn eval_having(
     expr: &NodeEnum,
     group_rows: &[Vec<Value>],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<bool, String> {
-    let val = eval_having_expr(expr, group_rows, table)?;
+    let val = eval_having_expr(expr, group_rows, ctx)?;
     Ok(matches!(val, Value::Bool(true)))
 }
 
 fn eval_having_expr(
     node: &NodeEnum,
     group_rows: &[Vec<Value>],
-    table: &Table,
+    ctx: &JoinContext,
 ) -> Result<Value, String> {
     match node {
         NodeEnum::FuncCall(fc) => {
             let name = extract_func_name(fc);
             if is_aggregate(&name) {
-                compute_aggregate(&name, fc, group_rows, table)
+                compute_aggregate(&name, fc, group_rows, ctx)
             } else {
                 Err(format!("non-aggregate function in HAVING: {}", name))
             }
@@ -1474,13 +1770,13 @@ fn eval_having_expr(
                 .lexpr
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
-                .map(|n| eval_having_expr(n, group_rows, table))
+                .map(|n| eval_having_expr(n, group_rows, ctx))
                 .transpose()?;
             let right = expr
                 .rexpr
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
-                .map(|n| eval_having_expr(n, group_rows, table))
+                .map(|n| eval_having_expr(n, group_rows, ctx))
                 .transpose()?;
 
             let (l, r) = match (left, right) {
@@ -1505,19 +1801,18 @@ fn eval_having_expr(
             Ok(result.map(Value::Bool).unwrap_or(Value::Null))
         }
         NodeEnum::AConst(_) | NodeEnum::Integer(_) | NodeEnum::Float(_) => {
-            let dummy = Table {
-                name: String::new(),
-                schema: String::new(),
-                columns: vec![],
+            let dummy_ctx = JoinContext {
+                sources: vec![],
+                total_columns: 0,
             };
-            eval_expr(node, &[], &dummy)
+            eval_expr(node, &[], &dummy_ctx)
         }
         NodeEnum::BoolExpr(be) => {
             let boolop = be.boolop;
             if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
-                        match eval_having_expr(n, group_rows, table)? {
+                        match eval_having_expr(n, group_rows, ctx)? {
                             Value::Bool(false) => return Ok(Value::Bool(false)),
                             Value::Bool(true) => continue,
                             _ => return Ok(Value::Null),
@@ -1528,7 +1823,7 @@ fn eval_having_expr(
             } else if boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
-                        match eval_having_expr(n, group_rows, table)? {
+                        match eval_having_expr(n, group_rows, ctx)? {
                             Value::Bool(true) => return Ok(Value::Bool(true)),
                             _ => continue,
                         }
@@ -1562,15 +1857,15 @@ fn exec_delete(
     let count = if delete.where_clause.is_some() {
         let table_def = catalog::get_table(schema, table_name)
             .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
-        // Validate WHERE clause first (propagates errors instead of silently excluding rows)
+        let ctx = JoinContext::single(schema, table_name, table_def.clone());
+        // Validate WHERE clause first
         let all_rows = storage::scan(schema, table_name)?;
         for row in &all_rows {
-            eval_where(&delete.where_clause, row, &table_def)?;
+            eval_where(&delete.where_clause, row, &ctx)?;
         }
-        // Now execute the delete — safe to unwrap since we validated above
         let wc = delete.where_clause.clone();
         storage::delete_where(schema, table_name, |row| {
-            eval_where(&wc, row, &table_def).unwrap_or(false)
+            eval_where(&wc, row, &ctx).unwrap_or(false)
         })?
     } else {
         storage::delete_all(schema, table_name)?
@@ -1601,6 +1896,7 @@ fn exec_update(
 
     let table_def = catalog::get_table(schema, table_name)
         .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    let ctx = JoinContext::single(schema, table_name, table_def.clone());
 
     let mut assignments: Vec<(usize, NodeEnum)> = Vec::new();
     for target in &update.target_list {
@@ -1620,25 +1916,26 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause against all rows first (error propagation)
+    // Validate WHERE clause against all rows first
     let all_rows = storage::scan(schema, table_name)?;
     for row in &all_rows {
-        eval_where(&update.where_clause, row, &table_def)?;
+        eval_where(&update.where_clause, row, &ctx)?;
     }
 
     let wc = update.where_clause.clone();
     let td = table_def.clone();
     let assigns = assignments.clone();
+    let ctx2 = JoinContext::single(schema, table_name, td.clone());
 
     let count = storage::update_rows_checked(
         schema,
         table_name,
-        |row| eval_where(&wc, row, &td).unwrap_or(false),
+        |row| eval_where(&wc, row, &ctx2).unwrap_or(false),
         |row| {
-            // Compute new row values, propagating errors
+            let ctx_inner = JoinContext::single(schema, table_name, td.clone());
             let mut new_row = row.clone();
             for (col_idx, expr_node) in &assigns {
-                new_row[*col_idx] = eval_expr(expr_node, row, &td)?;
+                new_row[*col_idx] = eval_expr(expr_node, row, &ctx_inner)?;
             }
             check_not_null(&td, &new_row)?;
             Ok(new_row)
@@ -2270,5 +2567,171 @@ mod tests {
         let err = execute("UPDATE t SET name = NULL WHERE id = 1");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("not-null"));
+    }
+
+    // ── JOIN tests ────────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn inner_join() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (id int, user_id int, total int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        execute("INSERT INTO orders VALUES (10, 1, 100)").unwrap();
+        execute("INSERT INTO orders VALUES (11, 1, 200)").unwrap();
+        execute("INSERT INTO orders VALUES (12, 2, 50)").unwrap();
+        let r = execute(
+            "SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn left_join() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (id int, user_id int, total int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        execute("INSERT INTO users VALUES (3, 'carol')").unwrap();
+        execute("INSERT INTO orders VALUES (10, 1, 100)").unwrap();
+        let r = execute(
+            "SELECT users.name, orders.total FROM users LEFT JOIN orders ON users.id = orders.user_id",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 3); // alice with order, bob NULL, carol NULL
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cross_join() {
+        setup();
+        execute("CREATE TABLE colors (name text)").unwrap();
+        execute("CREATE TABLE sizes (size text)").unwrap();
+        execute("INSERT INTO colors VALUES ('red')").unwrap();
+        execute("INSERT INTO colors VALUES ('blue')").unwrap();
+        execute("INSERT INTO sizes VALUES ('S')").unwrap();
+        execute("INSERT INTO sizes VALUES ('M')").unwrap();
+        execute("INSERT INTO sizes VALUES ('L')").unwrap();
+        let r = execute("SELECT * FROM colors CROSS JOIN sizes").unwrap();
+        assert_eq!(r.rows.len(), 6); // 2 * 3
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn implicit_join() {
+        setup();
+        execute("CREATE TABLE a (id int, val text)").unwrap();
+        execute("CREATE TABLE b (a_id int, data text)").unwrap();
+        execute("INSERT INTO a VALUES (1, 'x')").unwrap();
+        execute("INSERT INTO a VALUES (2, 'y')").unwrap();
+        execute("INSERT INTO b VALUES (1, 'linked')").unwrap();
+        let r = execute("SELECT a.val, b.data FROM a, b WHERE a.id = b.a_id").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("x".into()));
+        assert_eq!(r.rows[0][1], Some("linked".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn join_with_aliases() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (id int, user_id int, total int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO orders VALUES (10, 1, 100)").unwrap();
+        let r = execute(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+        assert_eq!(r.rows[0][1], Some("100".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn three_way_join() {
+        setup();
+        execute("CREATE TABLE a (id int, name text)").unwrap();
+        execute("CREATE TABLE b (id int, a_id int)").unwrap();
+        execute("CREATE TABLE c (id int, b_id int, val text)").unwrap();
+        execute("INSERT INTO a VALUES (1, 'root')").unwrap();
+        execute("INSERT INTO b VALUES (10, 1)").unwrap();
+        execute("INSERT INTO c VALUES (100, 10, 'leaf')").unwrap();
+        let r = execute(
+            "SELECT a.name, c.val FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("root".into()));
+        assert_eq!(r.rows[0][1], Some("leaf".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn right_join() {
+        setup();
+        execute("CREATE TABLE orders (id int, user_id int)").unwrap();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+        let r = execute(
+            "SELECT orders.id, users.name FROM orders RIGHT JOIN users ON users.id = orders.user_id",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 2); // alice with order, bob with NULL order
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn join_with_aggregate() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (id int, user_id int, total int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO users VALUES (2, 'bob')").unwrap();
+        execute("INSERT INTO orders VALUES (10, 1, 100)").unwrap();
+        execute("INSERT INTO orders VALUES (11, 1, 200)").unwrap();
+        execute("INSERT INTO orders VALUES (12, 2, 50)").unwrap();
+        let r = execute(
+            "SELECT users.name, SUM(orders.total) FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.name",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ambiguous_column_error() {
+        setup();
+        execute("CREATE TABLE a (id int, name text)").unwrap();
+        execute("CREATE TABLE b (id int, data text)").unwrap();
+        execute("INSERT INTO a VALUES (1, 'x')").unwrap();
+        execute("INSERT INTO b VALUES (1, 'y')").unwrap();
+        let err = execute("SELECT id FROM a JOIN b ON a.id = b.id");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("ambiguous"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn join_select_star() {
+        setup();
+        execute("CREATE TABLE t1 (a int, b text)").unwrap();
+        execute("CREATE TABLE t2 (c int, d text)").unwrap();
+        execute("INSERT INTO t1 VALUES (1, 'x')").unwrap();
+        execute("INSERT INTO t2 VALUES (2, 'y')").unwrap();
+        let r = execute("SELECT * FROM t1 CROSS JOIN t2").unwrap();
+        assert_eq!(r.columns.len(), 4); // a, b, c, d
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("x".into()));
+        assert_eq!(r.rows[0][2], Some("2".into()));
+        assert_eq!(r.rows[0][3], Some("y".into()));
     }
 }
