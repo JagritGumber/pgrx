@@ -741,13 +741,17 @@ fn eval_where(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
     row: &[Value],
     table: &Table,
-) -> bool {
+) -> Result<bool, String> {
     match where_clause {
         Some(wc) => match wc.node.as_ref() {
-            Some(expr) => matches!(eval_expr(expr, row, table), Ok(Value::Bool(true))),
-            None => true,
+            Some(expr) => match eval_expr(expr, row, table)? {
+                Value::Bool(b) => Ok(b),
+                Value::Null => Ok(false), // NULL in WHERE filters out the row
+                _ => Err("WHERE clause must return boolean".into()),
+            },
+            None => Ok(true),
         },
-        None => true,
+        None => Ok(true),
     }
 }
 
@@ -920,11 +924,13 @@ fn exec_select(
 
     let all_rows = storage::scan(&schema, &table_name)?;
 
-    // WHERE filter
-    let mut rows: Vec<Vec<Value>> = all_rows
-        .into_iter()
-        .filter(|row| eval_where(&select.where_clause, row, &table_def))
-        .collect();
+    // WHERE filter (propagates errors instead of silently excluding rows)
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for row in all_rows {
+        if eval_where(&select.where_clause, &row, &table_def)? {
+            rows.push(row);
+        }
+    }
 
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
@@ -1336,7 +1342,7 @@ fn compute_aggregate(
             for row in rows {
                 match eval_expr(arg, row, table)? {
                     Value::Int(n) => {
-                        si += n;
+                        si = si.checked_add(n).ok_or("integer out of range")?;
                         has_val = true;
                     }
                     Value::Float(f) => {
@@ -1556,10 +1562,24 @@ fn exec_delete(
     let count = if delete.where_clause.is_some() {
         let table_def = catalog::get_table(schema, table_name)
             .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
-        let wc = delete.where_clause.clone();
-        storage::delete_where(schema, table_name, |row| {
-            eval_where(&wc, row, &table_def)
-        })?
+        // Evaluate WHERE with error propagation, collect matching indices
+        let all_rows = storage::scan(schema, table_name)?;
+        let mut delete_indices = Vec::new();
+        for (i, row) in all_rows.iter().enumerate() {
+            if eval_where(&delete.where_clause, row, &table_def)? {
+                delete_indices.push(i);
+            }
+        }
+        let n = delete_indices.len() as u64;
+        if n > 0 {
+            storage::delete_where(schema, table_name, |row| {
+                // Safe: this closure only determines which rows to keep.
+                // Error propagation already happened above.
+                let wc = delete.where_clause.clone();
+                eval_where(&wc, row, &table_def).unwrap_or(false)
+            })?;
+        }
+        n
     } else {
         storage::delete_all(schema, table_name)?
     };
@@ -1608,6 +1628,12 @@ fn exec_update(
         }
     }
 
+    // Validate WHERE clause against all rows first (error propagation)
+    let all_rows = storage::scan(schema, table_name)?;
+    for row in &all_rows {
+        eval_where(&update.where_clause, row, &table_def)?;
+    }
+
     let wc = update.where_clause.clone();
     let td = table_def.clone();
     let assigns = assignments.clone();
@@ -1615,7 +1641,7 @@ fn exec_update(
     let count = storage::update_rows_checked(
         schema,
         table_name,
-        |row| eval_where(&wc, row, &td),
+        |row| eval_where(&wc, row, &td).unwrap_or(false),
         |row| {
             // Compute new row values, propagating errors
             let mut new_row = row.clone();
