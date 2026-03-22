@@ -1562,24 +1562,16 @@ fn exec_delete(
     let count = if delete.where_clause.is_some() {
         let table_def = catalog::get_table(schema, table_name)
             .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
-        // Evaluate WHERE with error propagation, collect matching indices
+        // Validate WHERE clause first (propagates errors instead of silently excluding rows)
         let all_rows = storage::scan(schema, table_name)?;
-        let mut delete_indices = Vec::new();
-        for (i, row) in all_rows.iter().enumerate() {
-            if eval_where(&delete.where_clause, row, &table_def)? {
-                delete_indices.push(i);
-            }
+        for row in &all_rows {
+            eval_where(&delete.where_clause, row, &table_def)?;
         }
-        let n = delete_indices.len() as u64;
-        if n > 0 {
-            storage::delete_where(schema, table_name, |row| {
-                // Safe: this closure only determines which rows to keep.
-                // Error propagation already happened above.
-                let wc = delete.where_clause.clone();
-                eval_where(&wc, row, &table_def).unwrap_or(false)
-            })?;
-        }
-        n
+        // Now execute the delete — safe to unwrap since we validated above
+        let wc = delete.where_clause.clone();
+        storage::delete_where(schema, table_name, |row| {
+            eval_where(&wc, row, &table_def).unwrap_or(false)
+        })?
     } else {
         storage::delete_all(schema, table_name)?
     };

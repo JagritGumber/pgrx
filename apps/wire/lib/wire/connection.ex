@@ -118,26 +118,31 @@ defmodule Wire.Connection do
   end
 
   defp dispatch(socket, ?P, body_len) do
-    recv_body(socket, body_len)
-    :gen_tcp.send(socket, <<"1", 4::32>>)
-    loop(socket)
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"1", 4::32>>); loop(socket)
+      :error -> :ok
+    end
   end
 
   defp dispatch(socket, ?B, body_len) do
-    recv_body(socket, body_len)
-    :gen_tcp.send(socket, <<"2", 4::32>>)
-    loop(socket)
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"2", 4::32>>); loop(socket)
+      :error -> :ok
+    end
   end
 
   defp dispatch(socket, ?S, body_len) do
-    recv_body(socket, body_len)
-    :gen_tcp.send(socket, <<"Z", 5::32, "I">>)
-    loop(socket)
+    case recv_body(socket, body_len) do
+      {:ok, _} -> :gen_tcp.send(socket, <<"Z", 5::32, "I">>); loop(socket)
+      :error -> :ok
+    end
   end
 
   defp dispatch(socket, _type, body_len) do
-    recv_body(socket, body_len)
-    loop(socket)
+    case recv_body(socket, body_len) do
+      {:ok, _} -> loop(socket)
+      :error -> :ok
+    end
   end
 
   # Safe recv that handles errors instead of crashing

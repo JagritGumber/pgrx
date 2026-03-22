@@ -411,7 +411,7 @@ fn run_memtest(
     println!();
     println!("=== SUMMARY ===");
     println!("  Baseline:      {} KB", rss0);
-    println!("  50 active:     {} KB (+{} KB)", rss1, rss1.saturating_sub(rss0));
-    println!("  50 hibernated: {} KB (freed {} KB)", rss2, freed);
+    println!("  {} active:     {} KB (+{} KB)", n_clients, rss1, rss1.saturating_sub(rss0));
+    println!("  {} hibernated: {} KB (freed {} KB)", n_clients, rss2, freed);
     println!("  After close:   {} KB", rss4);
 }
