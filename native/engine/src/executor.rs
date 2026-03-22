@@ -1001,14 +1001,15 @@ fn nested_loop_join(
 ) -> Result<Vec<Vec<Value>>, String> {
     let null_right = vec![Value::Null; right_width];
     let null_left = vec![Value::Null; left_width];
-    let mut result = Vec::new();
-    let mut right_matched = vec![false; right_rows.len()];
-
-    let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
-        || join_type == pg_query::protobuf::JoinType::Undefined as i32;
+    let mut result = Vec::with_capacity(left_rows.len());
     let is_left = join_type == pg_query::protobuf::JoinType::JoinLeft as i32;
     let is_right = join_type == pg_query::protobuf::JoinType::JoinRight as i32;
     let is_full = join_type == pg_query::protobuf::JoinType::JoinFull as i32;
+    let mut right_matched = if is_right || is_full {
+        vec![false; right_rows.len()]
+    } else {
+        Vec::new()
+    };
 
     for left in left_rows {
         let mut left_matched = false;
@@ -1024,7 +1025,9 @@ fn nested_loop_join(
 
             if matches {
                 left_matched = true;
-                right_matched[ri] = true;
+                if !right_matched.is_empty() {
+                    right_matched[ri] = true;
+                }
                 result.push(combined);
             }
         }
@@ -1034,8 +1037,6 @@ fn nested_loop_join(
             row.extend_from_slice(&null_right);
             result.push(row);
         }
-        // For INNER join with no matches, row is simply not emitted
-        let _ = is_inner;
     }
 
     if is_right || is_full {
@@ -1250,24 +1251,22 @@ fn exec_select(
         })
         .collect();
 
-    let result_rows: Vec<Vec<Option<String>>> = rows
-        .iter()
-        .map(|row| {
-            targets
-                .iter()
-                .map(|t| match t {
-                    SelectTarget::Column { idx, .. } => {
-                        row.get(*idx).and_then(|v| v.to_text())
-                    }
-                    SelectTarget::Expr { expr, .. } => {
-                        eval_expr(expr, row, &ctx)
-                            .ok()
-                            .and_then(|v| v.to_text())
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+    for row in &rows {
+        let mut result_row = Vec::new();
+        for t in &targets {
+            let cell = match t {
+                SelectTarget::Column { idx, .. } => {
+                    row.get(*idx).and_then(|v| v.to_text())
+                }
+                SelectTarget::Expr { expr, .. } => {
+                    eval_expr(expr, row, &ctx)?.to_text()
+                }
+            };
+            result_row.push(cell);
+        }
+        result_rows.push(result_row);
+    }
 
     let count = result_rows.len();
     Ok(QueryResult {
