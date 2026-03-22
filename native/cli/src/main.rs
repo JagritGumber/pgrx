@@ -191,7 +191,7 @@ fn run_concurrent(
     let total_queries = n_clients * queries_per_client;
     println!("{} clients × {} queries = {} total", n_clients, queries_per_client, total_queries);
 
-    let barrier = Arc::new(Barrier::new(n_clients as usize));
+    let barrier = Arc::new(Barrier::new(n_clients as usize + 1));
     let sql = Arc::new(sql.to_string());
     let host = Arc::new(host.to_string());
     let user = Arc::new(user.to_string());
@@ -231,9 +231,9 @@ fn run_concurrent(
         }));
     }
 
+    // Synchronize with worker threads so wall clock starts at the same moment
+    barrier.wait();
     let wall_start = Instant::now();
-    // Collect first to let barrier release happen naturally
-    // (threads are already running, wall_start is approximate)
 
     let mut all_times = Vec::new();
     let mut errors = 0u32;
