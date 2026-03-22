@@ -155,13 +155,9 @@ defmodule Wire.Connection do
         {:command, "EMPTY"}
 
       true ->
+        # Fix #4: NIF returns native Erlang terms, no JSON round-trip
         case Engine.execute_sql(sql) do
-          {:ok, json} ->
-            result = Jason.decode!(json)
-            columns = Enum.map(result["columns"], fn [name, oid] -> {name, oid} end)
-            rows = result["rows"]
-            tag = result["tag"]
-
+          {:ok, %{tag: tag, columns: columns, rows: rows}} ->
             if columns == [] and rows == [] do
               {:command, tag}
             else
