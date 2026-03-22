@@ -9,17 +9,17 @@ fn ping() -> &'static str {
     "pong from rust engine"
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn parse_sql(sql: &str) -> Result<String, String> {
     parser::parse(sql)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn parse_sql_ast(sql: &str) -> Result<String, String> {
     parser::parse_ast(sql)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn execute_sql(sql: &str) -> Result<String, String> {
     let result = executor::execute(sql)?;
     serde_json::to_string(&result).map_err(|e| e.to_string())
