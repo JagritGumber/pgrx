@@ -4,4 +4,5 @@ defmodule Engine.Native do
   def ping(), do: :erlang.nif_error(:nif_not_loaded)
   def parse_sql(_sql), do: :erlang.nif_error(:nif_not_loaded)
   def parse_sql_ast(_sql), do: :erlang.nif_error(:nif_not_loaded)
+  def execute_sql(_sql), do: :erlang.nif_error(:nif_not_loaded)
 end

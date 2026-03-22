@@ -123,15 +123,13 @@ defmodule Wire.Connection do
     send_ready(socket)
   end
 
-  # --- Query dispatch (Phase 0 — hardcoded responses) ---
+  # --- Query dispatch — routes to Rust engine via NIF ---
 
   defp run_query(sql) do
     normalized = sql |> String.downcase() |> String.trim_trailing(";") |> String.trim()
 
+    # Handle built-in functions that need BEAM-side responses
     cond do
-      normalized == "select 1" ->
-        {:rows, [{"?column?", 23}], [["1"]], "SELECT 1"}
-
       normalized == "select version()" ->
         v = "pgrx 0.1.0 on BEAM/OTP 27 + Rust — PostgreSQL 18.0 compatible"
         {:rows, [{"version", 25}], [[v]], "SELECT 1"}
@@ -139,14 +137,34 @@ defmodule Wire.Connection do
       normalized == "select current_database()" ->
         {:rows, [{"current_database", 25}], [["pgrx"]], "SELECT 1"}
 
-      String.starts_with?(normalized, "set ") ->
-        {:command, "SET"}
-
       normalized == "" ->
         {:command, "EMPTY"}
 
       true ->
-        {:error, "not yet implemented: " <> String.slice(sql, 0, 60)}
+        case Engine.execute_sql(sql) do
+          {:ok, json} ->
+            result = Jason.decode!(json)
+            columns = Enum.map(result["columns"], fn [name, oid] -> {name, oid} end)
+            rows = result["rows"]
+            tag = result["tag"]
+
+            if columns == [] and rows == [] do
+              {:command, tag}
+            else
+              text_rows =
+                Enum.map(rows, fn row ->
+                  Enum.map(row, fn
+                    nil -> nil
+                    val -> val
+                  end)
+                end)
+
+              {:rows, columns, text_rows, tag}
+            end
+
+          {:error, msg} ->
+            {:error, msg}
+        end
     end
   end
 
@@ -165,8 +183,12 @@ defmodule Wire.Connection do
   defp send_data_row(s, vals) do
     fields =
       for v <- vals, into: <<>> do
-        bytes = to_string(v)
-        <<byte_size(bytes)::32, bytes::binary>>
+        case v do
+          nil -> <<-1::signed-32>>
+          val ->
+            bytes = to_string(val)
+            <<byte_size(bytes)::32, bytes::binary>>
+        end
       end
 
     payload = <<length(vals)::16, fields::binary>>
