@@ -108,6 +108,88 @@ pub fn update_rows(
     Ok(count)
 }
 
+/// Insert with uniqueness check under a single write lock (no TOCTOU race).
+/// `unique_checks` is a list of (column_index, constraint_name) pairs.
+/// `pk_cols` is a list of column indices forming the composite primary key (if any).
+pub fn insert_checked(
+    schema: &str,
+    name: &str,
+    row: Row,
+    unique_checks: &[(usize, String)],
+    pk_cols: &[usize],
+) -> Result<(), String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+
+    // Composite PK check
+    if pk_cols.len() > 1 {
+        let new_key: Vec<&Value> = pk_cols.iter().map(|&i| &row[i]).collect();
+        for erow in &table.rows {
+            let ekey: Vec<&Value> = pk_cols.iter().map(|&i| &erow[i]).collect();
+            if new_key == ekey {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}.{}_pkey\"",
+                    schema, name
+                ));
+            }
+        }
+    }
+
+    // Per-column unique checks
+    for &(col_idx, ref cname) in unique_checks {
+        if matches!(row[col_idx], Value::Null) {
+            continue; // NULLs don't violate UNIQUE
+        }
+        for erow in &table.rows {
+            if col_idx < erow.len() && erow[col_idx] == row[col_idx] {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    cname
+                ));
+            }
+        }
+    }
+
+    table.rows.push(row);
+    Ok(())
+}
+
+/// Update matching rows with validation. Returns error if any updater fails.
+pub fn update_rows_checked(
+    schema: &str,
+    name: &str,
+    predicate: impl Fn(&Row) -> bool,
+    updater: impl Fn(&Row) -> Result<Row, String>,
+    validator: impl Fn(&Row, &[Row], usize) -> Result<(), String>,
+) -> Result<u64, String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+
+    // First pass: compute new rows and validate
+    let mut updates: Vec<(usize, Row)> = Vec::new();
+    for (idx, row) in table.rows.iter().enumerate() {
+        if predicate(row) {
+            let new_row = updater(row)?;
+            // Validate against all OTHER rows (excluding current)
+            validator(&new_row, &table.rows, idx)?;
+            updates.push((idx, new_row));
+        }
+    }
+
+    // Second pass: apply
+    let count = updates.len() as u64;
+    for (idx, new_row) in updates {
+        table.rows[idx] = new_row;
+    }
+    Ok(count)
+}
+
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let store = STORE.read();
     let table = store

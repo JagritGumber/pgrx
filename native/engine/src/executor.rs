@@ -287,8 +287,11 @@ fn exec_insert(
                     row[col_idx] = eval_const(val_node.node.as_ref());
                 }
 
-                check_constraints(&table_def, &row, schema)?;
-                storage::insert(schema, table_name, row)?;
+                check_not_null(&table_def, &row)?;
+                let (unique_checks, pk_cols) = build_unique_checks(&table_def);
+                storage::insert_checked(
+                    schema, table_name, row, &unique_checks, &pk_cols,
+                )?;
                 row_count += 1;
             }
         }
@@ -303,16 +306,7 @@ fn exec_insert(
 
 // ── Constraint enforcement ────────────────────────────────────────────
 
-fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), String> {
-    let pk_cols: Vec<usize> = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.primary_key)
-        .map(|(i, _)| i)
-        .collect();
-
-    // NOT NULL checks (no scan needed)
+fn check_not_null(table: &Table, row: &[Value]) -> Result<(), String> {
     for (i, col) in table.columns.iter().enumerate() {
         if !col.nullable && matches!(row[i], Value::Null) {
             return Err(format!(
@@ -321,24 +315,52 @@ fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), S
             ));
         }
     }
+    Ok(())
+}
 
-    // Check if any uniqueness checks are needed before scanning
-    let needs_unique_check = pk_cols.len() > 1
-        || table.columns.iter().enumerate().any(|(_, c)| {
-            (c.primary_key || c.unique)
-        });
+fn build_unique_checks(table: &Table) -> (Vec<(usize, String)>, Vec<usize>) {
+    let pk_cols: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.primary_key)
+        .map(|(i, _)| i)
+        .collect();
 
-    if !needs_unique_check {
-        return Ok(());
+    let mut unique_checks = Vec::new();
+    for (i, col) in table.columns.iter().enumerate() {
+        if col.primary_key && pk_cols.len() > 1 {
+            continue; // composite PK checked separately
+        }
+        if col.primary_key || col.unique {
+            let cname = if col.primary_key {
+                format!("{}_pkey", table.name)
+            } else {
+                format!("{}_{}_key", table.name, col.name)
+            };
+            unique_checks.push((i, cname));
+        }
     }
 
-    // Scan existing rows ONCE for all constraint checks
-    let existing = storage::scan(schema, &table.name)?;
+    (unique_checks, pk_cols)
+}
 
-    // Composite PK check
+/// Validate uniqueness of `new_row` against `all_rows`, excluding row at `skip_idx`.
+fn check_unique_against(
+    table: &Table,
+    new_row: &[Value],
+    all_rows: &[Vec<Value>],
+    skip_idx: usize,
+) -> Result<(), String> {
+    let (unique_checks, pk_cols) = build_unique_checks(table);
+
+    // Composite PK
     if pk_cols.len() > 1 {
-        let new_key: Vec<&Value> = pk_cols.iter().map(|&i| &row[i]).collect();
-        for erow in &existing {
+        let new_key: Vec<&Value> = pk_cols.iter().map(|&i| &new_row[i]).collect();
+        for (idx, erow) in all_rows.iter().enumerate() {
+            if idx == skip_idx {
+                continue;
+            }
             let ekey: Vec<&Value> = pk_cols.iter().map(|&i| &erow[i]).collect();
             if new_key == ekey {
                 return Err(format!(
@@ -349,24 +371,19 @@ fn check_constraints(table: &Table, row: &[Value], schema: &str) -> Result<(), S
         }
     }
 
-    // Per-column UNIQUE / single-column PK checks
-    for (i, col) in table.columns.iter().enumerate() {
-        if (col.primary_key || col.unique) && !matches!(row[i], Value::Null) {
-            if col.primary_key && pk_cols.len() > 1 {
+    for &(col_idx, ref cname) in &unique_checks {
+        if matches!(new_row[col_idx], Value::Null) {
+            continue;
+        }
+        for (idx, erow) in all_rows.iter().enumerate() {
+            if idx == skip_idx {
                 continue;
             }
-            for erow in &existing {
-                if i < erow.len() && erow[i] == row[i] {
-                    let cname = if col.primary_key {
-                        format!("{}_pkey", table.name)
-                    } else {
-                        format!("{}_{}_key", table.name, col.name)
-                    };
-                    return Err(format!(
-                        "duplicate key value violates unique constraint \"{}\"",
-                        cname
-                    ));
-                }
+            if col_idx < erow.len() && erow[col_idx] == new_row[col_idx] {
+                return Err(format!(
+                    "duplicate key value violates unique constraint \"{}\"",
+                    cname
+                ));
             }
         }
     }
@@ -1596,17 +1613,21 @@ fn exec_update(
     let td = table_def.clone();
     let assigns = assignments.clone();
 
-    let count = storage::update_rows(
+    let count = storage::update_rows_checked(
         schema,
         table_name,
         |row| eval_where(&wc, row, &td),
         |row| {
-            let old_row = row.clone();
+            // Compute new row values, propagating errors
+            let mut new_row = row.clone();
             for (col_idx, expr_node) in &assigns {
-                if let Ok(val) = eval_expr(expr_node, &old_row, &td) {
-                    row[*col_idx] = val;
-                }
+                new_row[*col_idx] = eval_expr(expr_node, row, &td)?;
             }
+            check_not_null(&td, &new_row)?;
+            Ok(new_row)
+        },
+        |new_row, all_rows, skip_idx| {
+            check_unique_against(&td, new_row, all_rows, skip_idx)
         },
     )?;
 
@@ -2193,5 +2214,44 @@ mod tests {
         let err = execute("SELECT id, COUNT(*) FROM t");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("GROUP BY"));
+    }
+
+    // ── Devin review fixes ────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn update_division_by_zero_errors() {
+        setup();
+        execute("CREATE TABLE t (id int, val int)").unwrap();
+        execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let err = execute("UPDATE t SET val = val / 0 WHERE id = 1");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("division by zero"));
+        // Row should be unchanged
+        let r = execute("SELECT val FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0][0], Some("10".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_enforces_unique_constraint() {
+        setup();
+        execute("CREATE TABLE t (id int PRIMARY KEY, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        let err = execute("UPDATE t SET id = 1 WHERE id = 2");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("unique constraint"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_enforces_not_null() {
+        setup();
+        execute("CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        let err = execute("UPDATE t SET name = NULL WHERE id = 1");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("not-null"));
     }
 }
