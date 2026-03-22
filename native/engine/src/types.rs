@@ -12,6 +12,19 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn compare(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Null, _) | (_, Value::Null) => None,
+            (Value::Int(a), Value::Int(b)) => a.partial_cmp(b),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+            (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
+            (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            _ => None,
+        }
+    }
+
     pub fn to_text(&self) -> Option<String> {
         match self {
             Value::Null => None,

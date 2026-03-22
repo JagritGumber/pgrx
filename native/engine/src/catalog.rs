@@ -14,6 +14,7 @@ pub struct Column {
     pub type_oid: TypeOid,
     pub nullable: bool,
     pub primary_key: bool,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,12 +103,14 @@ mod tests {
                     type_oid: TypeOid::Int4,
                     nullable: false,
                     primary_key: true,
+                    unique: true,
                 },
                 Column {
                     name: "name".to_string(),
                     type_oid: TypeOid::Text,
                     nullable: false,
                     primary_key: false,
+                    unique: false,
                 },
             ],
         }
