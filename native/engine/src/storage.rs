@@ -72,6 +72,42 @@ pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     Ok(count)
 }
 
+pub fn delete_where(
+    schema: &str,
+    name: &str,
+    predicate: impl Fn(&Row) -> bool,
+) -> Result<u64, String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let before = table.rows.len();
+    table.rows.retain(|row| !predicate(row));
+    Ok((before - table.rows.len()) as u64)
+}
+
+pub fn update_rows(
+    schema: &str,
+    name: &str,
+    predicate: impl Fn(&Row) -> bool,
+    updater: impl Fn(&mut Row),
+) -> Result<u64, String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut count = 0u64;
+    for row in table.rows.iter_mut() {
+        if predicate(row) {
+            updater(row);
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let store = STORE.read();
     let table = store
