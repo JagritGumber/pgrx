@@ -835,7 +835,12 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                                 has_null = true;
                                 continue;
                             }
-                            if test_val == inner_val {
+                            // Use compare() for type coercion (Int vs Float)
+                            // and == for same-type equality
+                            let is_eq = test_val == inner_val
+                                || test_val.compare(&inner_val)
+                                    == Some(std::cmp::Ordering::Equal);
+                            if is_eq {
                                 return Ok(Value::Bool(true));
                             }
                         }
@@ -978,7 +983,9 @@ fn eval_a_expr(
                         has_null = true;
                         continue;
                     }
-                    if left_val == item_val {
+                    let is_eq = left_val == item_val
+                        || left_val.compare(&item_val) == Some(std::cmp::Ordering::Equal);
+                    if is_eq {
                         return Ok(Value::Bool(!negated));
                     }
                 }
@@ -1181,6 +1188,16 @@ fn eval_func_call(
 }
 
 /// Parse a sequence name that may be schema-qualified ("public.myseq" or just "myseq").
+/// Parse a text string back to a typed Value based on the column's OID.
+fn parse_text_to_value(s: &str, oid: i32) -> Value {
+    match oid {
+        16 => Value::Bool(s == "t" || s == "true"),
+        20 | 21 | 23 => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s.into())),
+        700 | 701 | 1700 => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s.into())),
+        _ => Value::Text(s.into()),
+    }
+}
+
 fn parse_seq_name(s: &str) -> (&str, &str) {
     match s.split_once('.') {
         Some((schema, name)) => (schema, name),
@@ -1739,15 +1756,20 @@ fn exec_select_raw(
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
         let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
-        // Convert string rows back to Value rows
+        // Convert string rows back to typed Value rows using column OIDs
+        let col_oids: Vec<i32> = agg_result.columns.iter().map(|(_, oid)| *oid).collect();
         let value_rows: Vec<Vec<Value>> = agg_result
             .rows
             .into_iter()
             .map(|row| {
                 row.into_iter()
-                    .map(|cell| match cell {
-                        Some(s) => Value::Text(s),
+                    .enumerate()
+                    .map(|(i, cell)| match cell {
                         None => Value::Null,
+                        Some(s) => {
+                            let oid = col_oids.get(i).copied().unwrap_or(25);
+                            parse_text_to_value(&s, oid)
+                        }
                     })
                     .collect()
             })
