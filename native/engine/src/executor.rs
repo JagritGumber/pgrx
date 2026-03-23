@@ -854,6 +854,15 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                         let (_cols, inner_rows) =
                             exec_select_raw(sel, Some((row, ctx)))?;
 
+                        // NULL op ALL(empty) = TRUE, NULL op ALL(non-empty) = NULL
+                        if matches!(test_val, Value::Null) {
+                            return Ok(if inner_rows.is_empty() {
+                                Value::Bool(true)
+                            } else {
+                                Value::Null
+                            });
+                        }
+
                         let op = sl
                             .oper_name
                             .iter()
@@ -868,16 +877,21 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                             .next()
                             .unwrap_or_else(|| "=".into());
 
+                        // Three-valued logic: FALSE if any comparison is false,
+                        // NULL if no false but some NULL, TRUE if all true.
+                        let mut has_null = false;
                         for inner_row in &inner_rows {
                             let inner_val =
                                 inner_row.first().cloned().unwrap_or(Value::Null);
                             let cmp_result =
                                 eval_comparison_op(&op, &test_val, &inner_val)?;
-                            if !matches!(cmp_result, Value::Bool(true)) {
-                                return Ok(Value::Bool(false));
+                            match cmp_result {
+                                Value::Bool(true) => continue,
+                                Value::Bool(false) => return Ok(Value::Bool(false)),
+                                _ => has_null = true,
                             }
                         }
-                        return Ok(Value::Bool(true));
+                        return Ok(if has_null { Value::Null } else { Value::Bool(true) });
                     }
 
                     // Scalar subquery (ExprSublink)
