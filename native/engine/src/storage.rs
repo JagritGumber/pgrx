@@ -215,6 +215,17 @@ pub fn update_rows_checked(
     Ok(count)
 }
 
+/// Delete all rows and return them (for DELETE ... RETURNING without WHERE).
+/// Single write lock — no TOCTOU race.
+pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    Ok(std::mem::take(&mut table.rows))
+}
+
 pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let store = STORE.read();
     let table = store

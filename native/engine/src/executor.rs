@@ -444,7 +444,9 @@ fn eval_returning(
                     columns.push((alias, TypeOid::Text.oid()));
                     col_exprs.push(ReturningTarget::Expr(expr.clone()));
                 }
-                None => {}
+                None => {
+                    return Err("RETURNING clause contains an invalid expression".into());
+                }
             }
         }
     }
@@ -456,7 +458,14 @@ fn eval_returning(
         for target in &col_exprs {
             let val = match target {
                 ReturningTarget::Column(idx) => {
-                    row.get(*idx).cloned().unwrap_or(Value::Null)
+                    if *idx < row.len() {
+                        row[*idx].clone()
+                    } else {
+                        return Err(format!(
+                            "internal error: RETURNING column index {} out of range for row of width {}",
+                            idx, row.len()
+                        ));
+                    }
                 }
                 ReturningTarget::Expr(expr) => {
                     eval_expr(expr, row, &ctx)?
@@ -2052,8 +2061,7 @@ fn exec_delete(
         }
     } else {
         if has_returning {
-            let rows = storage::scan(schema, table_name)?;
-            storage::delete_all(schema, table_name)?;
+            let rows = storage::delete_all_returning(schema, table_name)?;
             let n = rows.len() as u64;
             (n, rows)
         } else {
