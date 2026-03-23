@@ -815,9 +815,13 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                             .ok_or("IN subquery missing test expression")?;
                         let test_val = eval_expr(test_node, row, ctx)?;
 
-                        // Execute inner query once per outer row (for correlated subqueries)
-                        let (_cols, inner_rows) =
+                        let (cols, inner_rows) =
                             exec_select_raw(sel, Some((row, ctx)))?;
+
+                        // Validate: subquery must return exactly one column
+                        if !cols.is_empty() && cols.len() != 1 {
+                            return Err("subquery must return only one column".into());
+                        }
 
                         if matches!(test_val, Value::Null) {
                             return Ok(Value::Null);
@@ -1425,7 +1429,7 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
                 .alias
                 .as_ref()
                 .map(|a| a.aliasname.clone())
-                .unwrap_or_else(|| "subquery".into());
+                .ok_or("subquery in FROM must have an alias")?;
 
             let columns: Vec<Column> = inner_cols
                 .iter()
@@ -1794,7 +1798,14 @@ fn exec_select_raw(
         for t in &targets {
             let val = match t {
                 SelectTarget::Column { idx, .. } => {
-                    row.get(*idx).cloned().unwrap_or(Value::Null)
+                    if *idx < row.len() {
+                        row[*idx].clone()
+                    } else {
+                        return Err(format!(
+                            "internal error: column index {} out of range for row of width {}",
+                            idx, row.len()
+                        ));
+                    }
                 }
                 SelectTarget::Expr { expr, .. } => {
                     eval_expr(expr, row, &merged_ctx)?
