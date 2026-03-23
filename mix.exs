@@ -18,6 +18,7 @@ defmodule Pgrx.MixProject do
         applications: [
           wire: :permanent,
           engine: :permanent,
+          router: :permanent,
           runtime_tools: :none
         ],
         strip_beams: true,

@@ -1,7 +1,8 @@
 ## Minimal memory footprint for pgrx
 
 ## 1 normal scheduler, 2 dirty CPU, 1 dirty IO
-+S 1:1
+## 2 normal schedulers avoids single-thread bottleneck under load
++S 2:2
 +SDcpu 2:2
 +SDio 1
 
