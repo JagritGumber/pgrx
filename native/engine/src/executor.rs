@@ -788,6 +788,117 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
             }
         }
         NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx),
+        NodeEnum::SubLink(sl) => {
+            let inner = sl
+                .subselect
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or("SubLink missing subselect")?;
+
+            match inner {
+                NodeEnum::SelectStmt(sel) => {
+                    let sub_type = sl.sub_link_type;
+
+                    // EXISTS
+                    if sub_type == pg_query::protobuf::SubLinkType::ExistsSublink as i32 {
+                        let (_cols, inner_rows) =
+                            exec_select_raw(sel, Some((row, ctx)))?;
+                        return Ok(Value::Bool(!inner_rows.is_empty()));
+                    }
+
+                    // ANY / IN (sub_link_type = AnySublink)
+                    if sub_type == pg_query::protobuf::SubLinkType::AnySublink as i32 {
+                        let test_node = sl
+                            .testexpr
+                            .as_ref()
+                            .and_then(|n| n.node.as_ref())
+                            .ok_or("IN subquery missing test expression")?;
+                        let test_val = eval_expr(test_node, row, ctx)?;
+
+                        // Execute inner query once per outer row (for correlated subqueries)
+                        let (_cols, inner_rows) =
+                            exec_select_raw(sel, Some((row, ctx)))?;
+
+                        if matches!(test_val, Value::Null) {
+                            return Ok(Value::Null);
+                        }
+
+                        let mut has_null = false;
+                        for inner_row in &inner_rows {
+                            let inner_val =
+                                inner_row.first().cloned().unwrap_or(Value::Null);
+                            if matches!(inner_val, Value::Null) {
+                                has_null = true;
+                                continue;
+                            }
+                            if test_val == inner_val {
+                                return Ok(Value::Bool(true));
+                            }
+                        }
+                        return Ok(if has_null {
+                            Value::Null
+                        } else {
+                            Value::Bool(false)
+                        });
+                    }
+
+                    // ALL (sub_link_type = AllSublink)
+                    if sub_type == pg_query::protobuf::SubLinkType::AllSublink as i32 {
+                        let test_node = sl
+                            .testexpr
+                            .as_ref()
+                            .and_then(|n| n.node.as_ref())
+                            .ok_or("ALL subquery missing test expression")?;
+                        let test_val = eval_expr(test_node, row, ctx)?;
+
+                        let (_cols, inner_rows) =
+                            exec_select_raw(sel, Some((row, ctx)))?;
+
+                        let op = sl
+                            .oper_name
+                            .iter()
+                            .filter_map(|n| n.node.as_ref())
+                            .filter_map(|n| {
+                                if let NodeEnum::String(s) = n {
+                                    Some(s.sval.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .next()
+                            .unwrap_or_else(|| "=".into());
+
+                        for inner_row in &inner_rows {
+                            let inner_val =
+                                inner_row.first().cloned().unwrap_or(Value::Null);
+                            let cmp_result =
+                                eval_comparison_op(&op, &test_val, &inner_val)?;
+                            if !matches!(cmp_result, Value::Bool(true)) {
+                                return Ok(Value::Bool(false));
+                            }
+                        }
+                        return Ok(Value::Bool(true));
+                    }
+
+                    // Scalar subquery (ExprSublink)
+                    if sub_type == pg_query::protobuf::SubLinkType::ExprSublink as i32 {
+                        let (_cols, inner_rows) =
+                            exec_select_raw(sel, Some((row, ctx)))?;
+                        if inner_rows.len() > 1 {
+                            return Err("more than one row returned by a subquery used as an expression".into());
+                        }
+                        return Ok(inner_rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .cloned()
+                            .unwrap_or(Value::Null));
+                    }
+
+                    Err(format!("unsupported subquery type: {}", sub_type))
+                }
+                _ => Err("SubLink subselect is not a SELECT".into()),
+            }
+        }
         _ => Err(format!(
             "unsupported expression node: {:?}",
             std::mem::discriminant(node)
@@ -795,11 +906,75 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
     }
 }
 
+fn eval_comparison_op(op: &str, left: &Value, right: &Value) -> Result<Value, String> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let cmp = left.compare(right);
+    let result = match op {
+        "=" => cmp.map(|o| o == std::cmp::Ordering::Equal),
+        "<>" | "!=" => cmp.map(|o| o != std::cmp::Ordering::Equal),
+        "<" => cmp.map(|o| o == std::cmp::Ordering::Less),
+        ">" => cmp.map(|o| o == std::cmp::Ordering::Greater),
+        "<=" => cmp.map(|o| o != std::cmp::Ordering::Greater),
+        ">=" => cmp.map(|o| o != std::cmp::Ordering::Less),
+        _ => return Err(format!("unsupported operator in ALL: {}", op)),
+    };
+    Ok(result.map(Value::Bool).unwrap_or(Value::Null))
+}
+
 fn eval_a_expr(
     expr: &pg_query::protobuf::AExpr,
     row: &[Value],
     ctx: &JoinContext,
 ) -> Result<Value, String> {
+    // Handle IN / NOT IN literal lists (AexprIn)
+    if expr.kind == pg_query::protobuf::AExprKind::AexprIn as i32 {
+        let in_op = extract_op_name(&expr.name).unwrap_or_default();
+        let negated = in_op == "<>";
+
+        let left_node = expr
+            .lexpr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or("IN missing left operand")?;
+        let left_val = eval_expr(left_node, row, ctx)?;
+
+        if matches!(left_val, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // rexpr is a List of values
+        let right_list = expr
+            .rexpr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or("IN missing right operand")?;
+
+        if let NodeEnum::List(list) = right_list {
+            let mut has_null = false;
+            for item in &list.items {
+                if let Some(item_node) = item.node.as_ref() {
+                    let item_val = eval_expr(item_node, row, ctx)?;
+                    if matches!(item_val, Value::Null) {
+                        has_null = true;
+                        continue;
+                    }
+                    if left_val == item_val {
+                        return Ok(Value::Bool(!negated));
+                    }
+                }
+            }
+            return Ok(if has_null {
+                Value::Null
+            } else {
+                Value::Bool(negated)
+            });
+        }
+
+        return Err("IN requires a list on the right".into());
+    }
+
     let op = extract_op_name(&expr.name)?;
 
     // Unary minus
@@ -1220,6 +1395,56 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
 
             Ok((result, merged))
         }
+        NodeEnum::RangeSubselect(rs) => {
+            let inner = rs
+                .subquery
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or("RangeSubselect missing subquery")?;
+
+            let NodeEnum::SelectStmt(sel) = inner else {
+                return Err("subquery in FROM is not a SELECT".into());
+            };
+
+            let (inner_cols, rows) = exec_select_raw(sel, None)?;
+            let alias = rs
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| "subquery".into());
+
+            let columns: Vec<Column> = inner_cols
+                .iter()
+                .map(|(name, oid)| Column {
+                    name: name.clone(),
+                    type_oid: TypeOid::from_oid(*oid),
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    default_expr: None,
+                })
+                .collect();
+
+            let ncols = columns.len();
+            let table_def = Table {
+                name: alias.clone(),
+                schema: String::new(),
+                columns,
+            };
+
+            let ctx = JoinContext {
+                sources: vec![JoinSource {
+                    alias,
+                    table_name: "subquery".into(),
+                    schema: String::new(),
+                    table_def,
+                    col_offset: 0,
+                }],
+                total_columns: ncols,
+            };
+
+            Ok((rows, ctx))
+        }
         _ => Err("unsupported FROM clause node".into()),
     }
 }
@@ -1431,32 +1656,90 @@ fn resolve_targets(
 
 // ── SELECT execution ──────────────────────────────────────────────────
 
-fn exec_select(
+/// Internal: execute a SELECT and return raw Value rows + column metadata.
+/// Used by subqueries and as the base for exec_select.
+fn exec_select_raw(
     select: &pg_query::protobuf::SelectStmt,
-) -> Result<QueryResult, String> {
+    outer: Option<(&[Value], &JoinContext)>,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
     if select.from_clause.is_empty() {
-        return exec_select_no_from(select);
+        return exec_select_raw_no_from(select, outer);
     }
 
     // Execute FROM clause (handles single table, JOINs, and implicit joins)
-    let (all_rows, ctx) = execute_from_clause(&select.from_clause)?;
+    let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
+
+    // If we have an outer context (correlated subquery), merge it
+    let (eval_rows, merged_ctx, outer_width) = if let Some((outer_row, outer_ctx)) = outer {
+        let outer_width = outer_ctx.total_columns;
+        // Merge: outer sources first, then inner sources (shifted)
+        let mut sources: Vec<JoinSource> = Vec::new();
+        for src in &outer_ctx.sources {
+            sources.push(JoinSource {
+                alias: src.alias.clone(),
+                table_name: src.table_name.clone(),
+                schema: src.schema.clone(),
+                table_def: src.table_def.clone(),
+                col_offset: src.col_offset,
+            });
+        }
+        for src in inner_ctx.sources {
+            sources.push(JoinSource {
+                alias: src.alias,
+                table_name: src.table_name,
+                schema: src.schema,
+                table_def: src.table_def,
+                col_offset: src.col_offset + outer_width,
+            });
+        }
+        let merged = JoinContext {
+            total_columns: outer_width + inner_ctx.total_columns,
+            sources,
+        };
+        // Prepend outer row to each inner row
+        let rows: Vec<Vec<Value>> = all_rows
+            .into_iter()
+            .map(|inner_row| {
+                let mut combined = outer_row.to_vec();
+                combined.extend(inner_row);
+                combined
+            })
+            .collect();
+        (rows, merged, outer_width)
+    } else {
+        (all_rows, inner_ctx, 0)
+    };
 
     // WHERE filter
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for row in all_rows {
-        if eval_where(&select.where_clause, &row, &ctx)? {
+    for row in eval_rows {
+        if eval_where(&select.where_clause, &row, &merged_ctx)? {
             rows.push(row);
         }
     }
 
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
-        return exec_select_aggregate(select, &ctx, rows);
+        let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
+        // Convert string rows back to Value rows
+        let value_rows: Vec<Vec<Value>> = agg_result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|cell| match cell {
+                        Some(s) => Value::Text(s),
+                        None => Value::Null,
+                    })
+                    .collect()
+            })
+            .collect();
+        return Ok((agg_result.columns, value_rows));
     }
 
     // ORDER BY (on full rows before projection)
     if !select.sort_clause.is_empty() {
-        let sort_keys = resolve_sort_keys(&select.sort_clause, &ctx, select)?;
+        let sort_keys = resolve_sort_keys(&select.sort_clause, &merged_ctx, select)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
     }
 
@@ -1480,49 +1763,72 @@ fn exec_select(
     }
 
     // Resolve targets and project
-    let targets = resolve_targets(select, &ctx)?;
+    let targets = resolve_targets(select, &merged_ctx)?;
     let columns: Vec<(String, i32)> = targets
         .iter()
         .map(|t| match t {
             SelectTarget::Column { name, idx } => {
-                Ok((name.clone(), column_type_oid(*idx, &ctx)?))
+                Ok((name.clone(), column_type_oid(*idx, &merged_ctx)?))
             }
             SelectTarget::Expr { name, .. } => Ok((name.clone(), TypeOid::Text.oid())),
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut result_rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut result_rows: Vec<Vec<Value>> = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
         for t in &targets {
-            let cell = match t {
+            let val = match t {
                 SelectTarget::Column { idx, .. } => {
-                    row.get(*idx).and_then(|v| v.to_text())
+                    row.get(*idx).cloned().unwrap_or(Value::Null)
                 }
                 SelectTarget::Expr { expr, .. } => {
-                    eval_expr(expr, row, &ctx)?.to_text()
+                    eval_expr(expr, row, &merged_ctx)?
                 }
             };
-            result_row.push(cell);
+            result_row.push(val);
         }
         result_rows.push(result_row);
     }
 
-    let count = result_rows.len();
-    Ok(QueryResult {
-        tag: format!("SELECT {}", count),
-        columns,
-        rows: result_rows,
-    })
+    Ok((columns, result_rows))
 }
 
-fn exec_select_no_from(
+/// Handle SELECT with no FROM clause, returning raw Values.
+fn exec_select_raw_no_from(
     select: &pg_query::protobuf::SelectStmt,
-) -> Result<QueryResult, String> {
-    let dummy_ctx = JoinContext {
-        sources: vec![],
-        total_columns: 0,
+    outer: Option<(&[Value], &JoinContext)>,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
+    let (eval_row, eval_ctx): (Vec<Value>, JoinContext) = if let Some((outer_row, outer_ctx)) = outer
+    {
+        let sources: Vec<JoinSource> = outer_ctx
+            .sources
+            .iter()
+            .map(|src| JoinSource {
+                alias: src.alias.clone(),
+                table_name: src.table_name.clone(),
+                schema: src.schema.clone(),
+                table_def: src.table_def.clone(),
+                col_offset: src.col_offset,
+            })
+            .collect();
+        (
+            outer_row.to_vec(),
+            JoinContext {
+                total_columns: outer_ctx.total_columns,
+                sources,
+            },
+        )
+    } else {
+        (
+            vec![],
+            JoinContext {
+                sources: vec![],
+                total_columns: 0,
+            },
+        )
     };
+
     let mut columns = Vec::new();
     let mut row = Vec::new();
 
@@ -1534,20 +1840,34 @@ fn exec_select_no_from(
                 rt.name.clone()
             };
             let val = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-                Some(expr) => eval_expr(expr, &[], &dummy_ctx)?,
+                Some(expr) => eval_expr(expr, &eval_row, &eval_ctx)?,
                 None => Value::Null,
             };
             columns.push((alias, TypeOid::Text.oid()));
-            row.push(val.to_text());
+            row.push(val);
         }
     }
 
+    Ok((columns, vec![row]))
+}
+
+fn exec_select(
+    select: &pg_query::protobuf::SelectStmt,
+) -> Result<QueryResult, String> {
+    let (columns, raw_rows) = exec_select_raw(select, None)?;
+    let rows: Vec<Vec<Option<String>>> = raw_rows
+        .iter()
+        .map(|row| row.iter().map(|v| v.to_text()).collect())
+        .collect();
+    let count = rows.len();
     Ok(QueryResult {
-        tag: "SELECT 1".into(),
+        tag: format!("SELECT {}", count),
         columns,
-        rows: vec![row],
+        rows,
     })
 }
+
+// exec_select_no_from replaced by exec_select_raw_no_from above
 
 // ── ORDER BY helpers ──────────────────────────────────────────────────
 
@@ -3095,5 +3415,106 @@ mod tests {
         // Actually, serial CREATE creates seq starting at 1
         // nextval from SELECT should advance it
         assert!(r.rows[0][0].is_some());
+    }
+
+    // ── Subquery tests ──────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn in_subquery() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (user_id int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')").unwrap();
+        execute("INSERT INTO orders VALUES (1), (1), (3)").unwrap();
+        let r =
+            execute("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders)").unwrap();
+        assert_eq!(r.rows.len(), 2); // alice, carol (not bob)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn not_in_subquery() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (user_id int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')").unwrap();
+        execute("INSERT INTO orders VALUES (1), (3)").unwrap();
+        let r = execute("SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1); // bob only
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exists_subquery() {
+        setup();
+        execute("CREATE TABLE users (id int, name text)").unwrap();
+        execute("CREATE TABLE orders (user_id int)").unwrap();
+        execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')").unwrap();
+        execute("INSERT INTO orders VALUES (1)").unwrap();
+        let r = execute(
+            "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scalar_subquery() {
+        setup();
+        execute("CREATE TABLE t (id int, val int)").unwrap();
+        execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let r = execute("SELECT (SELECT SUM(val) FROM t)").unwrap();
+        assert_eq!(r.rows[0][0], Some("60".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn in_literal_list() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        let r = execute("SELECT * FROM t WHERE id IN (1, 3)").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn not_in_literal_list() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        let r = execute("SELECT * FROM t WHERE id NOT IN (1, 3)").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][1], Some("b".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn derived_table() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        let r = execute(
+            "SELECT sub.name FROM (SELECT id, name FROM t WHERE id > 1) AS sub ORDER BY sub.name",
+        )
+        .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("b".into()));
+        assert_eq!(r.rows[1][0], Some("c".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scalar_subquery_too_many_rows() {
+        setup();
+        execute("CREATE TABLE t (id int)").unwrap();
+        execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        let err = execute("SELECT (SELECT id FROM t)");
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("more than one row"));
     }
 }

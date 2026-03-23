@@ -126,4 +126,20 @@ impl TypeOid {
     pub fn oid(&self) -> i32 {
         *self as i32
     }
+
+    pub fn from_oid(oid: i32) -> Self {
+        match oid {
+            16 => TypeOid::Bool,
+            17 => TypeOid::Bytea,
+            20 => TypeOid::Int8,
+            21 => TypeOid::Int2,
+            23 => TypeOid::Int4,
+            25 => TypeOid::Text,
+            700 => TypeOid::Float4,
+            701 => TypeOid::Float8,
+            1043 => TypeOid::Varchar,
+            1700 => TypeOid::Numeric,
+            _ => TypeOid::Text,
+        }
+    }
 }
