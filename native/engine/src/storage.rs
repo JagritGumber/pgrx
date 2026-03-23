@@ -87,6 +87,30 @@ pub fn delete_where(
     Ok((before - table.rows.len()) as u64)
 }
 
+/// Delete matching rows and return the deleted rows (for RETURNING clause).
+pub fn delete_where_returning(
+    schema: &str,
+    name: &str,
+    predicate: impl Fn(&Row) -> bool,
+) -> Result<Vec<Row>, String> {
+    let mut store = STORE.write();
+    let table = store
+        .tables
+        .get_mut(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    let mut deleted = Vec::new();
+    let mut kept = Vec::new();
+    for row in table.rows.drain(..) {
+        if predicate(&row) {
+            deleted.push(row);
+        } else {
+            kept.push(row);
+        }
+    }
+    table.rows = kept;
+    Ok(deleted)
+}
+
 pub fn update_rows(
     schema: &str,
     name: &str,
@@ -162,7 +186,7 @@ pub fn update_rows_checked(
     schema: &str,
     name: &str,
     predicate: impl Fn(&Row) -> bool,
-    updater: impl Fn(&Row) -> Result<Row, String>,
+    updater: impl FnMut(&Row) -> Result<Row, String>,
     validator: impl Fn(&Row, &[Row], usize) -> Result<(), String>,
 ) -> Result<u64, String> {
     let mut store = STORE.write();
@@ -173,6 +197,7 @@ pub fn update_rows_checked(
 
     // First pass: compute new rows and validate
     let mut updates: Vec<(usize, Row)> = Vec::new();
+    let mut updater = updater;
     for (idx, row) in table.rows.iter().enumerate() {
         if predicate(row) {
             let new_row = updater(row)?;

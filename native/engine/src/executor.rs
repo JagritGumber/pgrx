@@ -361,6 +361,100 @@ fn exec_drop(drop: &pg_query::protobuf::DropStmt) -> Result<QueryResult, String>
     })
 }
 
+// ── RETURNING clause evaluation ───────────────────────────────────────
+
+fn eval_returning(
+    returning_list: &[pg_query::protobuf::Node],
+    affected_rows: &[Vec<Value>],
+    table: &Table,
+    schema: &str,
+    table_name: &str,
+    tag: &str,
+) -> Result<QueryResult, String> {
+    if returning_list.is_empty() {
+        return Ok(QueryResult {
+            tag: tag.into(),
+            columns: vec![],
+            rows: vec![],
+        });
+    }
+
+    let ctx = JoinContext::single(schema, table_name, table.clone());
+
+    // Resolve RETURNING target columns (same logic as SELECT targets)
+    let mut columns = Vec::new();
+    let mut col_exprs: Vec<ReturningTarget> = Vec::new();
+
+    for node in returning_list {
+        if let Some(NodeEnum::ResTarget(rt)) = node.node.as_ref() {
+            let val_node = rt.val.as_ref().and_then(|v| v.node.as_ref());
+            match val_node {
+                Some(NodeEnum::ColumnRef(cref)) => {
+                    let fields = extract_string_fields(cref);
+                    let has_star = cref.fields.iter().any(|f| {
+                        matches!(f.node.as_ref(), Some(NodeEnum::AStar(_)))
+                    });
+                    if has_star {
+                        // RETURNING *
+                        for (i, col) in table.columns.iter().enumerate() {
+                            columns.push((col.name.clone(), col.type_oid.oid()));
+                            col_exprs.push(ReturningTarget::Column(i));
+                        }
+                    } else {
+                        let idx = resolve_column(cref, &ctx)?;
+                        let alias = if rt.name.is_empty() {
+                            fields.last().cloned().unwrap_or("?column?".into())
+                        } else {
+                            rt.name.clone()
+                        };
+                        columns.push((alias, column_type_oid(idx, &ctx)?));
+                        col_exprs.push(ReturningTarget::Column(idx));
+                    }
+                }
+                Some(expr) => {
+                    let alias = if rt.name.is_empty() {
+                        "?column?".into()
+                    } else {
+                        rt.name.clone()
+                    };
+                    columns.push((alias, TypeOid::Text.oid()));
+                    col_exprs.push(ReturningTarget::Expr(expr.clone()));
+                }
+                None => {}
+            }
+        }
+    }
+
+    // Evaluate RETURNING expressions against each affected row
+    let mut rows = Vec::new();
+    for row in affected_rows {
+        let mut result_row = Vec::new();
+        for target in &col_exprs {
+            let val = match target {
+                ReturningTarget::Column(idx) => {
+                    row.get(*idx).cloned().unwrap_or(Value::Null)
+                }
+                ReturningTarget::Expr(expr) => {
+                    eval_expr(expr, row, &ctx)?
+                }
+            };
+            result_row.push(val.to_text());
+        }
+        rows.push(result_row);
+    }
+
+    Ok(QueryResult {
+        tag: tag.into(),
+        columns,
+        rows,
+    })
+}
+
+enum ReturningTarget {
+    Column(usize),
+    Expr(NodeEnum),
+}
+
 // ── INSERT ────────────────────────────────────────────────────────────
 
 fn exec_insert(
@@ -404,6 +498,8 @@ fn exec_insert(
         .ok_or("INSERT missing VALUES")?;
 
     let mut row_count = 0u64;
+    let has_returning = !insert.returning_list.is_empty();
+    let mut inserted_rows: Vec<Vec<Value>> = Vec::new();
 
     if let NodeEnum::SelectStmt(sel) = select {
         for values_list in &sel.values_lists {
@@ -426,6 +522,9 @@ fn exec_insert(
 
                 check_not_null(&table_def, &row)?;
                 let (unique_checks, pk_cols) = build_unique_checks(&table_def);
+                if has_returning {
+                    inserted_rows.push(row.clone());
+                }
                 storage::insert_checked(
                     schema, table_name, row, &unique_checks, &pk_cols,
                 )?;
@@ -434,11 +533,12 @@ fn exec_insert(
         }
     }
 
-    Ok(QueryResult {
-        tag: format!("INSERT 0 {}", row_count),
-        columns: vec![],
-        rows: vec![],
-    })
+    let tag = format!("INSERT 0 {}", row_count);
+    if has_returning {
+        eval_returning(&insert.returning_list, &inserted_rows, &table_def, schema, table_name, &tag)
+    } else {
+        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
 }
 
 // ── Constraint enforcement ────────────────────────────────────────────
@@ -1854,28 +1954,48 @@ fn exec_delete(
         &rel.schemaname
     };
 
-    let count = if delete.where_clause.is_some() {
-        let table_def = catalog::get_table(schema, table_name)
-            .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    let table_def = catalog::get_table(schema, table_name)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    let has_returning = !delete.returning_list.is_empty();
+
+    let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        // Validate WHERE clause first
         let all_rows = storage::scan(schema, table_name)?;
         for row in &all_rows {
             eval_where(&delete.where_clause, row, &ctx)?;
         }
-        let wc = delete.where_clause.clone();
-        storage::delete_where(schema, table_name, |row| {
-            eval_where(&wc, row, &ctx).unwrap_or(false)
-        })?
+        if has_returning {
+            let wc = delete.where_clause.clone();
+            let rows = storage::delete_where_returning(schema, table_name, |row| {
+                eval_where(&wc, row, &ctx).unwrap_or(false)
+            })?;
+            let n = rows.len() as u64;
+            (n, rows)
+        } else {
+            let wc = delete.where_clause.clone();
+            let n = storage::delete_where(schema, table_name, |row| {
+                eval_where(&wc, row, &ctx).unwrap_or(false)
+            })?;
+            (n, vec![])
+        }
     } else {
-        storage::delete_all(schema, table_name)?
+        if has_returning {
+            let rows = storage::scan(schema, table_name)?;
+            storage::delete_all(schema, table_name)?;
+            let n = rows.len() as u64;
+            (n, rows)
+        } else {
+            let n = storage::delete_all(schema, table_name)?;
+            (n, vec![])
+        }
     };
 
-    Ok(QueryResult {
-        tag: format!("DELETE {}", count),
-        columns: vec![],
-        rows: vec![],
-    })
+    let tag = format!("DELETE {}", count);
+    if has_returning {
+        eval_returning(&delete.returning_list, &deleted_rows, &table_def, schema, table_name, &tag)
+    } else {
+        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
 }
 
 // ── UPDATE ────────────────────────────────────────────────────────────
@@ -1927,6 +2047,9 @@ fn exec_update(
     let assigns = assignments.clone();
     let ctx2 = JoinContext::single(schema, table_name, td.clone());
 
+    let has_returning = !update.returning_list.is_empty();
+    let mut updated_rows: Vec<Vec<Value>> = Vec::new();
+
     let count = storage::update_rows_checked(
         schema,
         table_name,
@@ -1938,6 +2061,9 @@ fn exec_update(
                 new_row[*col_idx] = eval_expr(expr_node, row, &ctx_inner)?;
             }
             check_not_null(&td, &new_row)?;
+            if has_returning {
+                updated_rows.push(new_row.clone());
+            }
             Ok(new_row)
         },
         |new_row, all_rows, skip_idx| {
@@ -1945,11 +2071,12 @@ fn exec_update(
         },
     )?;
 
-    Ok(QueryResult {
-        tag: format!("UPDATE {}", count),
-        columns: vec![],
-        rows: vec![],
-    })
+    let tag = format!("UPDATE {}", count);
+    if has_returning {
+        eval_returning(&update.returning_list, &updated_rows, &table_def, schema, table_name, &tag)
+    } else {
+        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
 }
 
 // ── TRUNCATE ──────────────────────────────────────────────────────────
@@ -2733,5 +2860,95 @@ mod tests {
         assert_eq!(r.rows[0][1], Some("x".into()));
         assert_eq!(r.rows[0][2], Some("2".into()));
         assert_eq!(r.rows[0][3], Some("y".into()));
+    }
+
+    // ── RETURNING clause tests ────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_returning_star() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        let r = execute("INSERT INTO t VALUES (1, 'alice') RETURNING *").unwrap();
+        assert_eq!(r.tag, "INSERT 0 1");
+        assert_eq!(r.columns.len(), 2);
+        assert_eq!(r.columns[0].0, "id");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_returning_specific_column() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        let r = execute("INSERT INTO t VALUES (1, 'alice') RETURNING id").unwrap();
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.columns[0].0, "id");
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_returning_multi_row() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        let r = execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob') RETURNING id, name").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn insert_returning_expression() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        let r = execute("INSERT INTO t VALUES (1, 'alice') RETURNING id, upper(name)").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("ALICE".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn update_returning() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        let r = execute("UPDATE t SET name = 'updated' WHERE id = 1 RETURNING *").unwrap();
+        assert_eq!(r.tag, "UPDATE 1");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("updated".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_returning() {
+        setup();
+        execute("CREATE TABLE t (id int, name text)").unwrap();
+        execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+        execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+        let r = execute("DELETE FROM t WHERE id = 1 RETURNING *").unwrap();
+        assert_eq!(r.tag, "DELETE 1");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+        // Verify row was actually deleted
+        let sel = execute("SELECT * FROM t").unwrap();
+        assert_eq!(sel.rows.len(), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn delete_all_returning() {
+        setup();
+        execute("CREATE TABLE t (id int)").unwrap();
+        execute("INSERT INTO t VALUES (1)").unwrap();
+        execute("INSERT INTO t VALUES (2)").unwrap();
+        let r = execute("DELETE FROM t RETURNING id").unwrap();
+        assert_eq!(r.rows.len(), 2);
     }
 }
