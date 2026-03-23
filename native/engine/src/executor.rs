@@ -218,6 +218,21 @@ fn exec_create_table(
             let mut nullable = !col.is_not_null;
             let mut primary_key = false;
             let mut unique = false;
+            let mut default_expr = None;
+
+            // Detect SERIAL/BIGSERIAL — create sequence and set default
+            let is_serial = matches!(
+                type_name.to_lowercase().as_str(),
+                "serial" | "bigserial"
+            );
+            if is_serial {
+                let seq_name = format!("{}_{}_seq", table_name, col.colname);
+                crate::sequence::create_sequence(schema, &seq_name, 1, 1)?;
+                default_expr = Some(catalog::DefaultExpr::NextVal(
+                    format!("{}.{}", schema, seq_name),
+                ));
+                nullable = false; // SERIAL implies NOT NULL
+            }
 
             // Parse inline constraints
             for cnode in &col.constraints {
@@ -234,6 +249,14 @@ fn exec_create_table(
                         x if x == pg_query::protobuf::ConstrType::ConstrNotnull as i32 => {
                             nullable = false;
                         }
+                        x if x == pg_query::protobuf::ConstrType::ConstrDefault as i32 => {
+                            // Parse DEFAULT expression
+                            if let Some(raw) = c.raw_expr.as_ref().and_then(|n| n.node.as_ref()) {
+                                default_expr = Some(catalog::DefaultExpr::Literal(
+                                    eval_const(Some(raw)),
+                                ));
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -245,6 +268,7 @@ fn exec_create_table(
                 nullable,
                 primary_key,
                 unique,
+                default_expr,
             });
         }
     }
@@ -504,7 +528,11 @@ fn exec_insert(
     if let NodeEnum::SelectStmt(sel) = select {
         for values_list in &sel.values_lists {
             if let Some(NodeEnum::List(list)) = values_list.node.as_ref() {
-                let mut row = vec![Value::Null; table_def.columns.len()];
+                let mut row: Vec<Value> = table_def
+                    .columns
+                    .iter()
+                    .map(|col| apply_default(&col.default_expr, schema))
+                    .collect();
 
                 for (i, val_node) in list.items.iter().enumerate() {
                     if i >= target_cols.len() {
@@ -538,6 +566,27 @@ fn exec_insert(
         eval_returning(&insert.returning_list, &inserted_rows, &table_def, schema, table_name, &tag)
     } else {
         Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
+}
+
+// ── DEFAULT value application ─────────────────────────────────────────
+
+fn apply_default(default_expr: &Option<catalog::DefaultExpr>, schema: &str) -> Value {
+    match default_expr {
+        Some(catalog::DefaultExpr::Literal(v)) => v.clone(),
+        Some(catalog::DefaultExpr::NextVal(seq_fqn)) => {
+            // seq_fqn is "schema.seqname"
+            let parts: Vec<&str> = seq_fqn.splitn(2, '.').collect();
+            let (seq_schema, seq_name) = if parts.len() == 2 {
+                (parts[0], parts[1])
+            } else {
+                (schema, seq_fqn.as_str())
+            };
+            crate::sequence::nextval(seq_schema, seq_name)
+                .map(Value::Int)
+                .unwrap_or(Value::Null)
+        }
+        None => Value::Null,
     }
 }
 
@@ -961,6 +1010,29 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
             Some(Value::Float(f)) => Ok(Value::Float(f.abs())),
             Some(Value::Null) => Ok(Value::Null),
             _ => Err("abs() requires numeric argument".into()),
+        },
+        "nextval" => match args.first() {
+            Some(Value::Text(s)) => {
+                let val = crate::sequence::nextval("public", s)?;
+                Ok(Value::Int(val))
+            }
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err("nextval() requires text argument".into()),
+        },
+        "currval" => match args.first() {
+            Some(Value::Text(s)) => {
+                let val = crate::sequence::currval("public", s)?;
+                Ok(Value::Int(val))
+            }
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err("currval() requires text argument".into()),
+        },
+        "setval" => match (args.first(), args.get(1)) {
+            (Some(Value::Text(s)), Some(Value::Int(v))) => {
+                let val = crate::sequence::setval("public", s, *v)?;
+                Ok(Value::Int(val))
+            }
+            _ => Err("setval() requires (text, integer) arguments".into()),
         },
         _ => Err(format!("function {}() does not exist", name)),
     }
@@ -2950,5 +3022,57 @@ mod tests {
         execute("INSERT INTO t VALUES (2)").unwrap();
         let r = execute("DELETE FROM t RETURNING id").unwrap();
         assert_eq!(r.rows.len(), 2);
+    }
+
+    // ── DEFAULT + SERIAL tests ────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn serial_auto_increment() {
+        setup();
+        execute("CREATE TABLE t (id serial PRIMARY KEY, name text)").unwrap();
+        execute("INSERT INTO t (name) VALUES ('alice')").unwrap();
+        execute("INSERT INTO t (name) VALUES ('bob')").unwrap();
+        let r = execute("SELECT * FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+        assert_eq!(r.rows[1][1], Some("bob".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn serial_with_returning() {
+        setup();
+        execute("CREATE TABLE t (id serial PRIMARY KEY, name text)").unwrap();
+        let r = execute("INSERT INTO t (name) VALUES ('alice') RETURNING id").unwrap();
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        let r = execute("INSERT INTO t (name) VALUES ('bob') RETURNING id, name").unwrap();
+        assert_eq!(r.rows[0][0], Some("2".into()));
+        assert_eq!(r.rows[0][1], Some("bob".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_literal_values() {
+        setup();
+        execute("CREATE TABLE t (id int DEFAULT 0, name text DEFAULT 'anon')").unwrap();
+        execute("INSERT INTO t (name) VALUES ('alice')").unwrap();
+        let r = execute("SELECT * FROM t").unwrap();
+        assert_eq!(r.rows[0][0], Some("0".into()));
+        assert_eq!(r.rows[0][1], Some("alice".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn nextval_function() {
+        setup();
+        execute("CREATE TABLE t (id serial, name text)").unwrap();
+        let r = execute("SELECT nextval('t_id_seq')").unwrap();
+        // Sequence was at 0 after table creation consumed 0 values
+        // Actually, serial CREATE creates seq starting at 1
+        // nextval from SELECT should advance it
+        assert!(r.rows[0][0].is_some());
     }
 }

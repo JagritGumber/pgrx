@@ -1,4 +1,4 @@
-use crate::types::TypeOid;
+use crate::types::{TypeOid, Value};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -8,6 +8,13 @@ use std::sync::LazyLock;
 /// No MVCC, no heap storage, no vacuum. Just a RwLock'd HashMap.
 static CATALOG: LazyLock<RwLock<Catalog>> = LazyLock::new(|| RwLock::new(Catalog::new()));
 
+/// Default value expression for a column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DefaultExpr {
+    Literal(Value),
+    NextVal(String), // fully qualified sequence name: "schema.seqname"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
@@ -15,6 +22,7 @@ pub struct Column {
     pub nullable: bool,
     pub primary_key: bool,
     pub unique: bool,
+    pub default_expr: Option<DefaultExpr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +95,7 @@ pub fn reset() {
     let mut cat = CATALOG.write();
     cat.tables.clear();
     cat.next_oid = 16384;
+    crate::sequence::reset();
 }
 
 #[cfg(test)]
@@ -104,6 +113,7 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: true,
+                    default_expr: None,
                 },
                 Column {
                     name: "name".to_string(),
@@ -111,6 +121,7 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    default_expr: None,
                 },
             ],
         }

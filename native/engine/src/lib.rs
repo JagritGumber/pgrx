@@ -1,6 +1,7 @@
 mod catalog;
 mod executor;
 mod parser;
+mod sequence;
 mod storage;
 mod types;
 
