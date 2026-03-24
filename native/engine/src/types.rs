@@ -13,6 +13,7 @@ pub enum Value {
     Float(f64),
     Text(String),
     Bytea(Vec<u8>),
+    Vector(Vec<f32>),
 }
 
 impl PartialEq for Value {
@@ -30,6 +31,7 @@ impl PartialEq for Value {
             }
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Bytea(a), Value::Bytea(b)) => a == b,
+            (Value::Vector(a), Value::Vector(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()),
             _ => false,
         }
     }
@@ -57,6 +59,12 @@ impl std::hash::Hash for Value {
             }
             Value::Text(s) => s.hash(state),
             Value::Bytea(b) => b.hash(state),
+            Value::Vector(v) => {
+                v.len().hash(state);
+                for f in v {
+                    f.to_bits().hash(state);
+                }
+            }
         }
     }
 }
@@ -71,6 +79,7 @@ impl Value {
             (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
             (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
+            (Value::Vector(_), Value::Vector(_)) => None, // vectors are not orderable
             _ => None,
         }
     }
@@ -83,6 +92,16 @@ impl Value {
             Value::Float(f) => Some(f.to_string()),
             Value::Text(s) => Some(s.clone()),
             Value::Bytea(b) => Some(format!("\\x{}", hex_encode(b))),
+            Value::Vector(v) => {
+                let inner: Vec<String> = v.iter().map(|f| {
+                    if *f == f.trunc() && f.is_finite() {
+                        format!("{}", *f as i64)
+                    } else {
+                        format!("{}", f)
+                    }
+                }).collect();
+                Some(format!("[{}]", inner.join(",")))
+            }
         }
     }
 }
@@ -104,6 +123,7 @@ pub enum TypeOid {
     Float8 = 701,
     Varchar = 1043,
     Numeric = 1700,
+    Vector = 16385,
 }
 
 impl TypeOid {
@@ -119,6 +139,7 @@ impl TypeOid {
             "text" => TypeOid::Text,
             "varchar" | "character varying" => TypeOid::Varchar,
             "bytea" => TypeOid::Bytea,
+            "vector" => TypeOid::Vector,
             _ => TypeOid::Text,
         }
     }
@@ -139,6 +160,7 @@ impl TypeOid {
             701 => TypeOid::Float8,
             1043 => TypeOid::Varchar,
             1700 => TypeOid::Numeric,
+            16385 => TypeOid::Vector,
             _ => TypeOid::Text,
         }
     }

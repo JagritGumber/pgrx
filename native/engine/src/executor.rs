@@ -566,6 +566,15 @@ fn exec_insert(
                     row[col_idx] = eval_const(val_node.node.as_ref());
                 }
 
+                // Coerce text values to vector type where the column expects it
+                for (i, col) in table_def.columns.iter().enumerate() {
+                    if col.type_oid == TypeOid::Vector {
+                        if let Value::Text(s) = &row[i] {
+                            row[i] = parse_vector_literal(s.trim());
+                        }
+                    }
+                }
+
                 check_not_null(&table_def, &row)?;
                 let (unique_checks, pk_cols) = build_unique_checks(&table_def);
                 if has_returning {
@@ -690,13 +699,29 @@ fn check_unique_against(
 
 // ── Expression evaluation ─────────────────────────────────────────────
 
+fn parse_vector_literal(s: &str) -> Value {
+    let inner = &s[1..s.len() - 1]; // strip [ and ]
+    let parts: Result<Vec<f32>, _> = inner.split(',').map(|p| p.trim().parse::<f32>()).collect();
+    match parts {
+        Ok(v) if !v.is_empty() => Value::Vector(v),
+        _ => Value::Text(s.to_string()),
+    }
+}
+
 fn eval_const(node: Option<&NodeEnum>) -> Value {
     match node {
         Some(NodeEnum::Integer(i)) => Value::Int(i.ival as i64),
         Some(NodeEnum::Float(f)) => {
             f.fval.parse::<f64>().map(Value::Float).unwrap_or(Value::Null)
         }
-        Some(NodeEnum::String(s)) => Value::Text(s.sval.clone()),
+        Some(NodeEnum::String(s)) => {
+            let trimmed = s.sval.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                parse_vector_literal(trimmed)
+            } else {
+                Value::Text(s.sval.clone())
+            }
+        }
         Some(NodeEnum::AConst(ac)) => {
             if let Some(val) = &ac.val {
                 match val {
@@ -706,7 +731,14 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
                         .parse::<f64>()
                         .map(Value::Float)
                         .unwrap_or(Value::Null),
-                    pg_query::protobuf::a_const::Val::Sval(s) => Value::Text(s.sval.clone()),
+                    pg_query::protobuf::a_const::Val::Sval(s) => {
+                        let trimmed = s.sval.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            parse_vector_literal(trimmed)
+                        } else {
+                            Value::Text(s.sval.clone())
+                        }
+                    }
                     pg_query::protobuf::a_const::Val::Bsval(s) => Value::Text(s.bsval.clone()),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Value::Bool(b.boolval),
                 }
@@ -748,7 +780,14 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                         .parse::<f64>()
                         .map(Value::Float)
                         .map_err(|e| e.to_string()),
-                    pg_query::protobuf::a_const::Val::Sval(s) => Ok(Value::Text(s.sval.clone())),
+                    pg_query::protobuf::a_const::Val::Sval(s) => {
+                        let trimmed = s.sval.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            Ok(parse_vector_literal(trimmed))
+                        } else {
+                            Ok(Value::Text(s.sval.clone()))
+                        }
+                    }
                     pg_query::protobuf::a_const::Val::Bsval(s) => Ok(Value::Text(s.bsval.clone())),
                     pg_query::protobuf::a_const::Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
                 }
@@ -762,14 +801,46 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|e| e.to_string()),
-        NodeEnum::String(s) => Ok(Value::Text(s.sval.clone())),
+        NodeEnum::String(s) => {
+            let trimmed = s.sval.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                Ok(parse_vector_literal(trimmed))
+            } else {
+                Ok(Value::Text(s.sval.clone()))
+            }
+        }
         NodeEnum::TypeCast(tc) => {
             let inner = tc
                 .arg
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
-            eval_expr(inner, row, ctx)
+            let val = eval_expr(inner, row, ctx)?;
+            // Handle cast to vector type
+            if let Some(tn) = &tc.type_name {
+                let type_name: String = tn
+                    .names
+                    .iter()
+                    .filter_map(|n| n.node.as_ref())
+                    .filter_map(|node| {
+                        if let NodeEnum::String(s) = node {
+                            Some(s.sval.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .last()
+                    .unwrap_or_default();
+                if type_name == "vector" {
+                    if let Value::Text(s) = &val {
+                        let trimmed = s.trim();
+                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                            return Ok(parse_vector_literal(trimmed));
+                        }
+                    }
+                }
+            }
+            Ok(val)
         }
         NodeEnum::AExpr(expr) => eval_a_expr(expr, row, ctx),
         NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, ctx),
@@ -1048,6 +1119,68 @@ fn eval_a_expr(
     // Arithmetic
     if matches!(op.as_str(), "+" | "-" | "*" | "/") {
         return eval_arithmetic(&op, &left, &right);
+    }
+
+    // Vector distance operators (return Float, not Bool — no NULL propagation needed here)
+    match op.as_str() {
+        "<->" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dist: f32 = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| (x - y) * (x - y))
+                        .sum::<f32>()
+                        .sqrt();
+                    Ok(Value::Float(dist as f64))
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <-> requires vector operands".into()),
+            };
+        }
+        "<=>" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    let denom = norm_a * norm_b;
+                    if denom == 0.0 {
+                        Ok(Value::Float(1.0))
+                    } else {
+                        Ok(Value::Float((1.0 - dot / denom) as f64))
+                    }
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <=> requires vector operands".into()),
+            };
+        }
+        "<#>" => {
+            return match (&left, &right) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
+                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+                    Ok(Value::Float((-dot) as f64))
+                }
+                (Value::Vector(a), Value::Vector(b)) => Err(format!(
+                    "different vector dimensions {} and {}",
+                    a.len(),
+                    b.len()
+                )),
+                _ => Err("operator <#> requires vector operands".into()),
+            };
+        }
+        _ => {}
     }
 
     // NULL propagation for comparisons
@@ -1779,8 +1912,15 @@ fn exec_select_raw(
 
     // ORDER BY (on full rows before projection)
     if !select.sort_clause.is_empty() {
-        let sort_keys = resolve_sort_keys(&select.sort_clause, &merged_ctx, select)?;
+        let (sort_keys, expr_count) =
+            resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
+        // Strip temporary expression columns appended for sorting
+        if expr_count > 0 {
+            for row in rows.iter_mut() {
+                row.truncate(row.len() - expr_count);
+            }
+        }
     }
 
     // OFFSET
@@ -1924,33 +2064,52 @@ struct SortKey {
     nulls_first: bool,
 }
 
-fn resolve_sort_keys(
+/// Extended ORDER BY resolver that supports arbitrary expressions (e.g. `embedding <-> '[1,0,0]'`).
+/// Expression results are appended as temporary columns to each row; the caller must strip them.
+/// Returns (sort_keys, number_of_expression_columns_appended).
+fn resolve_sort_keys_with_exprs(
     sort_clause: &[pg_query::protobuf::Node],
     ctx: &JoinContext,
     select: &pg_query::protobuf::SelectStmt,
-) -> Result<Vec<SortKey>, String> {
+    rows: &mut Vec<Vec<Value>>,
+) -> Result<(Vec<SortKey>, usize), String> {
     let mut keys = Vec::new();
+    let mut expr_nodes: Vec<(usize, &NodeEnum)> = Vec::new(); // (key_index, expr_node)
+    let base_width = if rows.is_empty() {
+        ctx.total_columns
+    } else {
+        rows[0].len()
+    };
+    let mut next_col = base_width;
+
     for snode in sort_clause {
         if let Some(NodeEnum::SortBy(sb)) = snode.node.as_ref() {
-            let col_idx = match sb.node.as_ref().and_then(|n| n.node.as_ref()) {
+            let inner = sb.node.as_ref().and_then(|n| n.node.as_ref());
+            let col_idx = match inner {
                 Some(NodeEnum::ColumnRef(cref)) => resolve_column(cref, ctx)?,
                 Some(NodeEnum::AConst(ac)) => {
-                    // Ordinal: ORDER BY 1 means first column in target list
                     let ordinal = match &ac.val {
                         Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize,
                         _ => return Err("invalid ORDER BY ordinal".into()),
                     };
                     resolve_ordinal_to_col_idx(ordinal, select, ctx)?
                 }
-                _ => return Err("unsupported ORDER BY expression".into()),
+                Some(expr_node) => {
+                    // Arbitrary expression — will be evaluated per-row
+                    let idx = next_col;
+                    next_col += 1;
+                    expr_nodes.push((keys.len(), expr_node));
+                    idx
+                }
+                None => return Err("ORDER BY missing expression".into()),
             };
 
-            let ascending = sb.sortby_dir
-                != pg_query::protobuf::SortByDir::SortbyDesc as i32;
+            let ascending =
+                sb.sortby_dir != pg_query::protobuf::SortByDir::SortbyDesc as i32;
             let nulls_first = match sb.sortby_nulls {
                 x if x == pg_query::protobuf::SortByNulls::SortbyNullsFirst as i32 => true,
                 x if x == pg_query::protobuf::SortByNulls::SortbyNullsLast as i32 => false,
-                _ => !ascending, // default: NULLS LAST for ASC, FIRST for DESC
+                _ => !ascending,
             };
 
             keys.push(SortKey {
@@ -1960,7 +2119,30 @@ fn resolve_sort_keys(
             });
         }
     }
-    Ok(keys)
+
+    let expr_count = next_col - base_width;
+
+    // Evaluate expression ORDER BY keys for every row
+    if expr_count > 0 {
+        for row in rows.iter_mut() {
+            // Pre-extend with Nulls
+            row.resize(next_col, Value::Null);
+        }
+        // Need to clone expr_nodes data to avoid borrow issues
+        let expr_data: Vec<(usize, NodeEnum)> = expr_nodes
+            .iter()
+            .map(|(ki, node)| (*ki, (*node).clone()))
+            .collect();
+        for row in rows.iter_mut() {
+            for (key_idx, expr_node) in &expr_data {
+                let col_idx = keys[*key_idx].col_idx;
+                let val = eval_expr(expr_node, row, ctx)?;
+                row[col_idx] = val;
+            }
+        }
+    }
+
+    Ok((keys, expr_count))
 }
 
 fn resolve_ordinal_to_col_idx(
@@ -3563,5 +3745,96 @@ mod tests {
         let err = execute("SELECT (SELECT id FROM t)");
         assert!(err.is_err());
         assert!(err.unwrap_err().contains("more than one row"));
+    }
+
+    // ── Vector type tests ────────────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_create_insert_select() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0, 3.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[4.0, 5.0, 6.0]')").unwrap();
+        let r = execute("SELECT * FROM items").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][1], Some("[1,2,3]".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_l2_distance() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 0.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[0.0, 1.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (3, '[1.0, 1.0, 0.0]')").unwrap();
+        // L2 distance from [1,0,0]: item 1=0, item 3=1, item 2=sqrt(2)
+        let r = execute("SELECT id FROM items ORDER BY embedding <-> '[1.0, 0.0, 0.0]' LIMIT 2")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into())); // closest
+        assert_eq!(r.rows[1][0], Some("3".into())); // second closest
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_cosine_distance() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 0.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[0.0, 1.0]')").unwrap();
+        execute("INSERT INTO items VALUES (3, '[0.707, 0.707]')").unwrap();
+        // Cosine distance from [1,0]: item 1=0, item 3~0.29, item 2=1
+        let r = execute("SELECT id FROM items ORDER BY embedding <=> '[1.0, 0.0]' LIMIT 2")
+            .unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_inner_product() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0, 3.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[3.0, 2.0, 1.0]')").unwrap();
+        // Inner product with [1,0,0]: item 1=1, item 2=3
+        // Negative inner product: item 1=-1, item 2=-3
+        // ORDER BY <#> (ascending): item 2 first (most similar via inner product)
+        let r =
+            execute("SELECT id FROM items ORDER BY embedding <#> '[1.0, 0.0, 0.0]'").unwrap();
+        assert_eq!(r.rows[0][0], Some("2".into())); // highest inner product
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_dimension_mismatch() {
+        setup();
+        execute("CREATE TABLE items (id int, embedding vector)").unwrap();
+        execute("INSERT INTO items VALUES (1, '[1.0, 2.0]')").unwrap();
+        execute("INSERT INTO items VALUES (2, '[1.0, 2.0, 3.0]')").unwrap();
+        // Different dimensions should error
+        let err = execute("SELECT id FROM items ORDER BY embedding <-> '[1.0, 2.0]'");
+        // This will error during the sort comparison
+        assert!(err.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn vector_knn_search() {
+        setup();
+        execute("CREATE TABLE points (id int, pos vector)").unwrap();
+        execute("INSERT INTO points VALUES (1, '[0.0, 0.0]')").unwrap();
+        execute("INSERT INTO points VALUES (2, '[1.0, 1.0]')").unwrap();
+        execute("INSERT INTO points VALUES (3, '[2.0, 2.0]')").unwrap();
+        execute("INSERT INTO points VALUES (4, '[10.0, 10.0]')").unwrap();
+        // KNN: 3 nearest to [1.5, 1.5]
+        let r = execute("SELECT id FROM points ORDER BY pos <-> '[1.5, 1.5]' LIMIT 3").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("2".into())); // [1,1] closest to [1.5,1.5]
+        assert_eq!(r.rows[1][0], Some("3".into())); // [2,2] next
+        // third is [0,0] which is closer than [10,10]
+        assert_eq!(r.rows[2][0], Some("1".into()));
     }
 }
