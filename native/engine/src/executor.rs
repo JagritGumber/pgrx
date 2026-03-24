@@ -1,11 +1,19 @@
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
+use lru::LruCache;
+use parking_lot::Mutex;
 use pg_query::NodeEnum;
 use serde::Serialize;
 
 use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
+
+// Parse cache: avoids re-parsing the same SQL through pg_query's C FFI.
+// LRU with 1024 entries. Each entry caches the protobuf ParseResult.
+static PARSE_CACHE: LazyLock<Mutex<LruCache<String, pg_query::protobuf::ParseResult>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(std::num::NonZeroUsize::new(1024).unwrap())));
 
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
@@ -69,6 +77,19 @@ fn resolve_column(
     cref: &pg_query::protobuf::ColumnRef,
     ctx: &JoinContext,
 ) -> Result<usize, String> {
+    // Fast path: single-source, single-field (unqualified) column reference.
+    // This is the most common case (single-table SELECT) and avoids the
+    // Vec<String> allocation from extract_string_fields entirely.
+    if cref.fields.len() == 1 && ctx.sources.len() == 1 {
+        if let Some(NodeEnum::String(s)) = cref.fields[0].node.as_ref() {
+            let src = &ctx.sources[0];
+            if let Some(pos) = src.table_def.columns.iter().position(|c| c.name == s.sval) {
+                return Ok(src.col_offset + pos);
+            }
+            return Err(format!("column \"{}\" does not exist", s.sval));
+        }
+    }
+
     let fields = extract_string_fields(cref);
 
     match fields.len() {
@@ -152,10 +173,22 @@ fn column_type_oid(idx: usize, ctx: &JoinContext) -> Result<i32, String> {
 }
 
 pub fn execute(sql: &str) -> Result<QueryResult, String> {
-    let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+    // Check parse cache first — avoids expensive C FFI for repeated queries
+    let protobuf = {
+        let mut cache = PARSE_CACHE.lock();
+        if let Some(cached) = cache.get(sql) {
+            cached.clone()
+        } else {
+            drop(cache); // release lock during parse
+            let parsed = pg_query::parse(sql).map_err(|e| e.to_string())?;
+            let proto = parsed.protobuf;
+            let mut cache = PARSE_CACHE.lock();
+            cache.put(sql.to_string(), proto.clone());
+            proto
+        }
+    };
 
-    let raw_stmt = parsed
-        .protobuf
+    let raw_stmt = protobuf
         .stmts
         .first()
         .ok_or("empty query")?;
@@ -1701,57 +1734,116 @@ fn exec_select_raw(
         return exec_select_raw_no_from(select, outer);
     }
 
-    // Execute FROM clause (handles single table, JOINs, and implicit joins)
-    let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
+    // Fast path: single-table FROM (RangeVar) with no outer context.
+    // Uses scan_with to run WHERE inside the read lock, cloning only
+    // matching rows instead of the entire table.
+    let is_single_rangevar = outer.is_none()
+        && select.from_clause.len() == 1
+        && matches!(
+            select.from_clause[0].node.as_ref(),
+            Some(NodeEnum::RangeVar(_))
+        );
 
-    // If we have an outer context (correlated subquery), merge it
-    let (eval_rows, merged_ctx, outer_width) = if let Some((outer_row, outer_ctx)) = outer {
-        let outer_width = outer_ctx.total_columns;
-        // Merge: outer sources first, then inner sources (shifted)
-        let mut sources: Vec<JoinSource> = Vec::new();
-        for src in &outer_ctx.sources {
-            sources.push(JoinSource {
-                alias: src.alias.clone(),
-                table_name: src.table_name.clone(),
-                schema: src.schema.clone(),
-                table_def: src.table_def.clone(),
-                col_offset: src.col_offset,
-            });
-        }
-        for src in inner_ctx.sources {
-            sources.push(JoinSource {
-                alias: src.alias,
-                table_name: src.table_name,
-                schema: src.schema,
-                table_def: src.table_def,
-                col_offset: src.col_offset + outer_width,
-            });
-        }
-        let merged = JoinContext {
-            total_columns: outer_width + inner_ctx.total_columns,
-            sources,
+    let (mut rows, merged_ctx) = if is_single_rangevar {
+        // Extract RangeVar info
+        let rv = match select.from_clause[0].node.as_ref() {
+            Some(NodeEnum::RangeVar(rv)) => rv,
+            _ => unreachable!(),
         };
-        // Prepend outer row to each inner row
-        let rows: Vec<Vec<Value>> = all_rows
-            .into_iter()
-            .map(|inner_row| {
-                let mut combined = outer_row.to_vec();
-                combined.extend(inner_row);
-                combined
-            })
-            .collect();
-        (rows, merged, outer_width)
-    } else {
-        (all_rows, inner_ctx, 0)
-    };
+        let alias = rv
+            .alias
+            .as_ref()
+            .map(|a| a.aliasname.clone())
+            .unwrap_or_else(|| rv.relname.clone());
+        let schema = if rv.schemaname.is_empty() {
+            "public"
+        } else {
+            &rv.schemaname
+        };
+        let table_def = catalog::get_table(schema, &rv.relname)
+            .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+        let ncols = table_def.columns.len();
+        let ctx = JoinContext {
+            sources: vec![JoinSource {
+                alias,
+                table_name: rv.relname.clone(),
+                schema: schema.to_string(),
+                table_def,
+                col_offset: 0,
+            }],
+            total_columns: ncols,
+        };
 
-    // WHERE filter
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    for row in eval_rows {
-        if eval_where(&select.where_clause, &row, &merged_ctx)? {
-            rows.push(row);
+        // scan_with: WHERE filter runs inside the read lock.
+        // Only matching rows are cloned — for selective queries this is
+        // orders of magnitude fewer clones than cloning the full table.
+        let wc = &select.where_clause;
+        let filtered = storage::scan_with(schema, &rv.relname, |all_rows| {
+            let mut rows = Vec::new();
+            for row in all_rows {
+                if eval_where(wc, row, &ctx)? {
+                    rows.push(row.clone());
+                }
+            }
+            Ok(rows)
+        })?;
+
+        (filtered, ctx)
+    } else {
+        // General path: JOINs, implicit cross joins, subselects, correlated subqueries
+        let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
+
+        // If we have an outer context (correlated subquery), merge it
+        let (eval_rows, merged_ctx, _outer_width) = if let Some((outer_row, outer_ctx)) = outer {
+            let outer_width = outer_ctx.total_columns;
+            // Merge: outer sources first, then inner sources (shifted)
+            let mut sources: Vec<JoinSource> = Vec::new();
+            for src in &outer_ctx.sources {
+                sources.push(JoinSource {
+                    alias: src.alias.clone(),
+                    table_name: src.table_name.clone(),
+                    schema: src.schema.clone(),
+                    table_def: src.table_def.clone(),
+                    col_offset: src.col_offset,
+                });
+            }
+            for src in inner_ctx.sources {
+                sources.push(JoinSource {
+                    alias: src.alias,
+                    table_name: src.table_name,
+                    schema: src.schema,
+                    table_def: src.table_def,
+                    col_offset: src.col_offset + outer_width,
+                });
+            }
+            let merged = JoinContext {
+                total_columns: outer_width + inner_ctx.total_columns,
+                sources,
+            };
+            // Prepend outer row to each inner row
+            let rows: Vec<Vec<Value>> = all_rows
+                .into_iter()
+                .map(|inner_row| {
+                    let mut combined = outer_row.to_vec();
+                    combined.extend(inner_row);
+                    combined
+                })
+                .collect();
+            (rows, merged, outer_width)
+        } else {
+            (all_rows, inner_ctx, 0)
+        };
+
+        // WHERE filter
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for row in eval_rows {
+            if eval_where(&select.where_clause, &row, &merged_ctx)? {
+                rows.push(row);
+            }
         }
-    }
+
+        (rows, merged_ctx)
+    };
 
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {

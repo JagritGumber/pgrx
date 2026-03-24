@@ -61,6 +61,21 @@ pub fn scan(schema: &str, name: &str) -> Result<Vec<Row>, String> {
     Ok(table.rows.clone())
 }
 
+/// Zero-copy scan: passes a shared reference to the rows into `f`,
+/// avoiding the full-table clone that `scan()` performs.
+/// The caller clones only the rows it actually needs (e.g., WHERE matches).
+pub fn scan_with<F, R>(schema: &str, name: &str, f: F) -> Result<R, String>
+where
+    F: FnOnce(&[Row]) -> Result<R, String>,
+{
+    let store = STORE.read();
+    let table = store
+        .tables
+        .get(&key(schema, name))
+        .ok_or_else(|| format!("table \"{}.{}\" not found in storage", schema, name))?;
+    f(&table.rows)
+}
+
 pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     let mut store = STORE.write();
     let table = store
