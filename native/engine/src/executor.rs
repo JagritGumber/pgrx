@@ -1600,15 +1600,18 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
 
             let quals = je.quals.as_ref().and_then(|n| n.node.as_ref());
 
-            let result = nested_loop_join(
-                &left_rows,
-                &right_rows,
-                je.jointype,
-                quals,
-                &merged,
-                left_width,
-                right_width,
-            )?;
+            // MySQL-style: hash join for equi-joins, nested loop for theta/cross.
+            let result = match try_equi_hash_join(
+                &left_rows, &right_rows, je.jointype,
+                quals, &merged, left_width, right_width,
+            ) {
+                Some(Ok(rows)) => rows,
+                Some(Err(e)) => return Err(e),
+                None => nested_loop_join(
+                    &left_rows, &right_rows, je.jointype,
+                    quals, &merged, left_width, right_width,
+                )?,
+            };
 
             Ok((result, merged))
         }
@@ -1664,6 +1667,155 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
         }
         _ => Err("unsupported FROM clause node".into()),
     }
+}
+
+/// Try to execute an equi-join as a hash join (O(N+M)).
+/// Returns None if the ON clause isn't a simple equi-join.
+/// Returns Some(Ok(rows)) on success, Some(Err) on execution error.
+fn try_equi_hash_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    join_type: i32,
+    quals: Option<&NodeEnum>,
+    ctx: &JoinContext,
+    left_width: usize,
+    right_width: usize,
+) -> Option<Result<Vec<Vec<Value>>, String>> {
+    // Extract equi-join key columns from the ON clause
+    let quals = quals?;
+    let (left_col, right_col) = extract_equi_cols(quals, ctx)?;
+
+    Some(execute_hash_join(
+        left_rows, right_rows, join_type, ctx,
+        left_width, right_width, left_col, right_col,
+    ))
+}
+
+/// Extract the column indices for a simple equi-join: ON a.x = b.y
+fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usize)> {
+    match quals {
+        NodeEnum::AExpr(expr) => {
+            let op = expr.name.iter()
+                .filter_map(|n| n.node.as_ref())
+                .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                .next()?;
+            if op != "=" { return None; }
+
+            let left_node = expr.lexpr.as_ref()?.node.as_ref()?;
+            let right_node = expr.rexpr.as_ref()?.node.as_ref()?;
+
+            if let (NodeEnum::ColumnRef(lcref), NodeEnum::ColumnRef(rcref)) = (left_node, right_node) {
+                let li = resolve_column(lcref, ctx).ok()?;
+                let ri = resolve_column(rcref, ctx).ok()?;
+                Some((li, ri))
+            } else {
+                None
+            }
+        }
+        // AND: take the first equality condition
+        NodeEnum::BoolExpr(be) if be.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            for arg in &be.args {
+                if let Some(result) = arg.node.as_ref().and_then(|n| extract_equi_cols(n, ctx)) {
+                    return Some(result);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Hash join: build hash table on right side, probe with left side. O(N+M).
+fn execute_hash_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    join_type: i32,
+    ctx: &JoinContext,
+    left_width: usize,
+    right_width: usize,
+    left_key_col: usize,
+    right_key_col: usize,
+) -> Result<Vec<Vec<Value>>, String> {
+    let null_right = vec![Value::Null; right_width];
+    let null_left = vec![Value::Null; left_width];
+
+    let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
+        || join_type == pg_query::protobuf::JoinType::Undefined as i32;
+    let is_left = join_type == pg_query::protobuf::JoinType::JoinLeft as i32;
+    let is_right = join_type == pg_query::protobuf::JoinType::JoinRight as i32;
+    let is_full = join_type == pg_query::protobuf::JoinType::JoinFull as i32;
+
+    if !is_inner && !is_left && !is_right && !is_full {
+        return Err(format!("unsupported JOIN type: {}", join_type));
+    }
+
+    // Ensure left_key is in [0..left_width) and right_key is in [left_width..)
+    // The ON clause might have them in either order.
+    let (left_key_col, right_key_col) = if left_key_col < left_width && right_key_col >= left_width {
+        (left_key_col, right_key_col)
+    } else if right_key_col < left_width && left_key_col >= left_width {
+        (right_key_col, left_key_col) // swap
+    } else {
+        // Both on same side — can't hash join this, fall back
+        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width);
+    };
+    let right_local_key = right_key_col - left_width;
+
+    // BUILD phase: hash table on right side, keyed by join column value
+    let mut hash_table: HashMap<Value, Vec<usize>> = HashMap::new();
+    for (i, row) in right_rows.iter().enumerate() {
+        if right_local_key < row.len() {
+            let key = row[right_local_key].clone();
+            hash_table.entry(key).or_default().push(i);
+        }
+    }
+
+    let mut result = Vec::with_capacity(left_rows.len());
+    let mut right_matched = if is_right || is_full {
+        vec![false; right_rows.len()]
+    } else {
+        Vec::new()
+    };
+
+    // PROBE phase: for each left row, look up matching right rows in O(1)
+    for left in left_rows {
+        if left_key_col >= left.len() { continue; }
+        let key = &left[left_key_col];
+        let mut left_matched = false;
+
+        if let Some(indices) = hash_table.get(key) {
+            for &ri in indices {
+                left_matched = true;
+                if !right_matched.is_empty() {
+                    right_matched[ri] = true;
+                }
+                let mut combined = Vec::with_capacity(left_width + right_width);
+                combined.extend_from_slice(left);
+                combined.extend_from_slice(&right_rows[ri]);
+                result.push(combined);
+            }
+        }
+
+        // LEFT/FULL: emit unmatched left row with NULLs
+        if !left_matched && (is_left || is_full) {
+            let mut row = left.clone();
+            row.extend_from_slice(&null_right);
+            result.push(row);
+        }
+    }
+
+    // RIGHT/FULL: emit unmatched right rows
+    if is_right || is_full {
+        for (ri, right) in right_rows.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut row = null_left.clone();
+                row.extend_from_slice(right);
+                result.push(row);
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 fn nested_loop_join(
