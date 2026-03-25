@@ -1,5 +1,7 @@
 # pgRx
 
+> **This project is in early development and highly unstable.** APIs, storage format, and wire protocol behavior will change without notice. Do not use in production. Contributions and feedback welcome — just know that everything is actively being reworked.
+
 **PostgreSQL-compatible database built on BEAM + Rust.**
 
 Same SQL. Same drivers. 100x less memory per connection.
