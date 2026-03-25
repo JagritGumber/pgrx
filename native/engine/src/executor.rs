@@ -1523,7 +1523,10 @@ struct FastEqualityFilter {
 impl FastEqualityFilter {
     #[inline(always)]
     fn matches(&self, row: &[Value]) -> bool {
-        self.col_idx < row.len() && row[self.col_idx] == self.value
+        if self.col_idx >= row.len() { return false; }
+        let v = &row[self.col_idx];
+        // Use both == (same-type fast path) and compare() (cross-type: Int vs Float)
+        *v == self.value || v.compare(&self.value) == Some(std::cmp::Ordering::Equal)
     }
 }
 
