@@ -75,11 +75,28 @@ fn resolve_column(
     cref: &pg_query::protobuf::ColumnRef,
     ctx: &JoinContext,
 ) -> Result<usize, String> {
+    // Fast path: single-source, single-field (most common case)
+    // Avoids Vec allocation from extract_string_fields entirely
+    if ctx.sources.len() == 1 {
+        if let Some(last_field) = cref.fields.last().and_then(|f| f.node.as_ref()) {
+            if let NodeEnum::String(s) = last_field {
+                let src = &ctx.sources[0];
+                if let Some(pos) = src.table_def.columns.iter().position(|c| c.name == s.sval) {
+                    return Ok(src.col_offset + pos);
+                }
+                // For 2-field qualified refs on single source, also fast-path
+                if cref.fields.len() == 2 {
+                    return Err(format!("column \"{}\" does not exist", s.sval));
+                }
+            }
+        }
+    }
+
+    // General path for multi-source (JOINs) and edge cases
     let fields = extract_string_fields(cref);
 
     match fields.len() {
         1 => {
-            // Unqualified: search all sources, error if ambiguous
             let col_name = &fields[0];
             let mut found = Vec::new();
             for src in &ctx.sources {
