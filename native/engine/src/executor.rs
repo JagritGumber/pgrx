@@ -2199,7 +2199,7 @@ fn exec_select_raw(
             // Uses pooled buffer to avoid per-query Vec allocation (Principle 2).
             let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx);
             let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
-                let mut filtered = take_row_buf();
+                let mut filtered = Vec::new();
                 if let Some(ref ff) = fast_filter {
                     // Fast path: direct column comparison — no eval_expr overhead.
                     // Principle 4: vectorized WHERE for simple equality.
@@ -2270,7 +2270,7 @@ fn exec_select_raw(
     };
 
     // WHERE filter — pooled buffer avoids per-query allocation (Principle 2)
-    let mut rows = take_row_buf();
+    let mut rows = Vec::new();
     for row in eval_rows {
         if eval_where(&select.where_clause, &row, &merged_ctx)? {
             rows.push(row);
@@ -2384,7 +2384,7 @@ fn exec_select_raw_post_filter(
         .collect::<Result<Vec<_>, String>>()?;
 
     // Projection — pooled buffer for result rows (Principle 2)
-    let mut result_rows = take_row_buf();
+    let mut result_rows = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
         for t in &targets {
@@ -2409,7 +2409,7 @@ fn exec_select_raw_post_filter(
     }
 
     // Return the input rows buffer to the pool (consumed, no longer needed)
-    return_row_buf(rows);
+    
 
     Ok((columns, result_rows))
 }
