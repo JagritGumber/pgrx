@@ -94,8 +94,8 @@ impl Value {
             Value::Bytea(b) => Some(format!("\\x{}", hex_encode(b))),
             Value::Vector(v) => {
                 let inner: Vec<String> = v.iter().map(|f| {
-                    if *f == f.trunc() && f.is_finite() {
-                        format!("{}", *f as i64)
+                    if *f == f.trunc() && f.is_finite() && f.abs() < (i32::MAX as f32) {
+                        format!("{}", *f as i32)
                     } else {
                         format!("{}", f)
                     }

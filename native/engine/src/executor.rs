@@ -570,7 +570,7 @@ fn exec_insert(
                 for (i, col) in table_def.columns.iter().enumerate() {
                     if col.type_oid == TypeOid::Vector {
                         if let Value::Text(s) = &row[i] {
-                            row[i] = parse_vector_literal(s.trim());
+                            row[i] = parse_vector_literal(s.trim())?;
                         }
                     }
                 }
@@ -699,13 +699,27 @@ fn check_unique_against(
 
 // ── Expression evaluation ─────────────────────────────────────────────
 
-fn parse_vector_literal(s: &str) -> Value {
-    let inner = &s[1..s.len() - 1]; // strip [ and ]
-    let parts: Result<Vec<f32>, _> = inner.split(',').map(|p| p.trim().parse::<f32>()).collect();
-    match parts {
-        Ok(v) if !v.is_empty() => Value::Vector(v),
-        _ => Value::Text(s.to_string()),
+fn parse_vector_literal(s: &str) -> Result<Value, String> {
+    if s.len() < 2 || !s.starts_with('[') || !s.ends_with(']') {
+        return Err(format!("malformed vector literal: \"{}\"", s));
     }
+    let inner = &s[1..s.len() - 1];
+    if inner.trim().is_empty() {
+        return Err("vector must have at least 1 dimension".into());
+    }
+    let parts: Vec<f32> = inner
+        .split(',')
+        .map(|p| {
+            p.trim()
+                .parse::<f32>()
+                .map_err(|e| format!("invalid vector element \"{}\": {}", p.trim(), e))
+        })
+        .collect::<Result<_, _>>()?;
+    // Reject NaN and Infinity (matches pgvector behavior)
+    if let Some(bad) = parts.iter().find(|f| !f.is_finite()) {
+        return Err(format!("vector elements must be finite, got {}", bad));
+    }
+    Ok(Value::Vector(parts))
 }
 
 fn eval_const(node: Option<&NodeEnum>) -> Value {
@@ -717,7 +731,7 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
         Some(NodeEnum::String(s)) => {
             let trimmed = s.sval.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                parse_vector_literal(trimmed)
+                parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
             } else {
                 Value::Text(s.sval.clone())
             }
@@ -734,7 +748,7 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
                     pg_query::protobuf::a_const::Val::Sval(s) => {
                         let trimmed = s.sval.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            parse_vector_literal(trimmed)
+                            parse_vector_literal(trimmed).unwrap_or(Value::Text(s.sval.clone()))
                         } else {
                             Value::Text(s.sval.clone())
                         }
@@ -783,7 +797,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                     pg_query::protobuf::a_const::Val::Sval(s) => {
                         let trimmed = s.sval.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            Ok(parse_vector_literal(trimmed))
+                            parse_vector_literal(trimmed)
                         } else {
                             Ok(Value::Text(s.sval.clone()))
                         }
@@ -804,7 +818,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
         NodeEnum::String(s) => {
             let trimmed = s.sval.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                Ok(parse_vector_literal(trimmed))
+                parse_vector_literal(trimmed)
             } else {
                 Ok(Value::Text(s.sval.clone()))
             }
@@ -835,7 +849,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                     if let Value::Text(s) = &val {
                         let trimmed = s.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            return Ok(parse_vector_literal(trimmed));
+                            return parse_vector_literal(trimmed);
                         }
                     }
                 }
