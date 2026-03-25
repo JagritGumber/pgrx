@@ -76,6 +76,7 @@ pub fn get_table(schema: &str, name: &str) -> Option<Table> {
     cat.tables.get(&fqn(schema, name)).cloned()
 }
 
+#[allow(dead_code)]
 pub fn table_exists(schema: &str, name: &str) -> bool {
     let cat = CATALOG.read();
     cat.tables.contains_key(&fqn(schema, name))
@@ -92,6 +93,7 @@ pub fn list_tables(schema: &str) -> Vec<Table> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn reset() {
     let mut cat = CATALOG.write();
     cat.tables.clear();

@@ -72,6 +72,7 @@ pub fn drop_sequence(schema: &str, name: &str) {
     seqs.remove(&key(schema, name));
 }
 
+#[allow(dead_code)]
 pub fn reset() {
     let mut seqs = SEQUENCES.write();
     seqs.clear();

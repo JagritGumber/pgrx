@@ -87,6 +87,7 @@ pub fn drop_table(schema: &str, name: &str) {
     store.remove(&key(schema, name));
 }
 
+#[allow(dead_code)]
 pub fn insert(schema: &str, name: &str, row: Row) -> Result<(), String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
@@ -398,6 +399,7 @@ pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     Ok(table.rows.len() as u64)
 }
 
+#[allow(dead_code)]
 pub fn reset() {
     let mut store = STORE.write();
     store.clear();
