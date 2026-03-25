@@ -1866,7 +1866,45 @@ fn exec_select_raw(
         return exec_select_raw_no_from(select, outer);
     }
 
-    // Execute FROM clause (handles single table, JOINs, and implicit joins)
+    // Fast path: single-table query with no outer context — use scan_with
+    // to filter inside the lock and clone only matching rows.
+    if select.from_clause.len() == 1 && outer.is_none() {
+        if let Some(NodeEnum::RangeVar(rv)) = select.from_clause[0].node.as_ref() {
+            let schema = if rv.schemaname.is_empty() { "public" } else { &rv.schemaname };
+            let table_def = catalog::get_table(schema, &rv.relname)
+                .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
+            let alias = rv.alias.as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_else(|| rv.relname.clone());
+            let ncols = table_def.columns.len();
+            let ctx = JoinContext {
+                sources: vec![JoinSource {
+                    alias,
+                    table_name: rv.relname.clone(),
+                    #[allow(dead_code)]
+                    schema: schema.to_string(),
+                    table_def,
+                    col_offset: 0,
+                }],
+                total_columns: ncols,
+            };
+
+            // Filter inside the read lock — clone only matching rows
+            let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
+                let mut filtered = Vec::new();
+                for row in all_rows {
+                    if eval_where(&select.where_clause, row, &ctx)? {
+                        filtered.push(row.clone());
+                    }
+                }
+                Ok(filtered)
+            })?;
+
+            return exec_select_raw_post_filter(select, ctx, rows, 0);
+        }
+    }
+
+    // General path: JOINs, implicit joins, subqueries, correlated
     let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
 
     // If we have an outer context (correlated subquery), merge it
@@ -1918,6 +1956,16 @@ fn exec_select_raw(
         }
     }
 
+    return exec_select_raw_post_filter(select, merged_ctx, rows, outer_width);
+}
+
+/// Shared post-filter logic: aggregates, ORDER BY, LIMIT, projection.
+fn exec_select_raw_post_filter(
+    select: &pg_query::protobuf::SelectStmt,
+    merged_ctx: JoinContext,
+    mut rows: Vec<Vec<Value>>,
+    outer_width: usize,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
         let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
