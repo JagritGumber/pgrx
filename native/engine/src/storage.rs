@@ -1,3 +1,4 @@
+use crate::hnsw::{DistanceMetric, HnswIndex};
 use crate::types::Value;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -25,6 +26,8 @@ struct TableStore {
     pk_cols: Vec<usize>,
     /// Composite PK index: set of composite key tuples.
     pk_index: Option<HashSet<Vec<Value>>>,
+    /// Optional HNSW index for vector KNN queries.
+    hnsw_index: Option<HnswIndex>,
 }
 
 fn key(schema: &str, name: &str) -> String {
@@ -50,6 +53,7 @@ pub fn create_table(schema: &str, name: &str) {
             unique_indexes: HashMap::new(),
             pk_cols: Vec::new(),
             pk_index: None,
+            hnsw_index: None,
         })),
     );
 }
@@ -122,6 +126,7 @@ pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
     if let Some(ref mut pk_idx) = table.pk_index {
         pk_idx.clear();
     }
+    table.hnsw_index = None;
     Ok(count)
 }
 
@@ -201,6 +206,20 @@ fn rebuild_indexes(table: &mut TableStore) {
             let key: Vec<Value> = table.pk_cols.iter().map(|&i| row[i].clone()).collect();
             pk_idx.insert(key);
         }
+    }
+    // Rebuild HNSW index — row_ids are positional, so any row shift invalidates them
+    if let Some(ref old_hnsw) = table.hnsw_index {
+        let col_idx = old_hnsw.col_idx();
+        let metric = old_hnsw.metric();
+        let mut new_hnsw = crate::hnsw::HnswIndex::new(metric, col_idx);
+        for (i, row) in table.rows.iter().enumerate() {
+            if col_idx < row.len() {
+                if let Value::Vector(v) = &row[col_idx] {
+                    new_hnsw.insert(i, v.clone());
+                }
+            }
+        }
+        table.hnsw_index = Some(new_hnsw);
     }
 }
 
@@ -389,6 +408,7 @@ pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String
     if let Some(ref mut pk_idx) = table.pk_index {
         pk_idx.clear();
     }
+    table.hnsw_index = None;
     Ok(std::mem::take(&mut table.rows))
 }
 
@@ -397,6 +417,84 @@ pub fn row_count(schema: &str, name: &str) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let table = tbl.read();
     Ok(table.rows.len() as u64)
+}
+
+/// Ensure the table has an HNSW index on the given column.
+/// Creates the index if it doesn't exist yet, and bulk-inserts existing rows.
+pub fn ensure_hnsw_index(
+    schema: &str,
+    name: &str,
+    col_idx: usize,
+    metric: DistanceMetric,
+) -> Result<(), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+    if let Some(ref existing) = table.hnsw_index {
+        if existing.metric() == metric {
+            return Ok(()); // already indexed with matching metric
+        }
+        // Metric mismatch — rebuild with new metric
+    }
+    let mut idx = HnswIndex::new(metric, col_idx);
+    // Bulk-insert existing rows
+    for (row_id, row) in table.rows.iter().enumerate() {
+        if let Some(Value::Vector(v)) = row.get(col_idx) {
+            idx.insert(row_id, v.clone());
+        }
+    }
+    table.hnsw_index = Some(idx);
+    Ok(())
+}
+
+/// Add a single vector to the HNSW index (called after row insertion).
+pub fn hnsw_insert(
+    schema: &str,
+    name: &str,
+    row_id: usize,
+    vector: Vec<f32>,
+) -> Result<(), String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+    if let Some(ref mut idx) = table.hnsw_index {
+        idx.insert(row_id, vector);
+    }
+    Ok(())
+}
+
+/// Search the HNSW index. Returns (distance, row_id) pairs sorted ascending.
+pub fn hnsw_search(
+    schema: &str,
+    name: &str,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<(f32, usize)>, String> {
+    let tbl = get_table(schema, name)?;
+    let table = tbl.read();
+    match &table.hnsw_index {
+        Some(idx) => Ok(idx.search(query, k, k.max(64))),
+        None => Err("no HNSW index on this table".into()),
+    }
+}
+
+/// Check if a table has an HNSW index and return the indexed column index.
+pub fn has_hnsw_index(schema: &str, name: &str) -> Option<usize> {
+    let tbl = get_table(schema, name).ok()?;
+    let table = tbl.read();
+    table.hnsw_index.as_ref().map(|idx| idx.col_idx())
+}
+
+/// Fetch rows by their row IDs (indices into the internal rows vec).
+/// Returns rows in the order of the provided IDs.
+pub fn get_rows_by_ids(schema: &str, name: &str, ids: &[usize]) -> Result<Vec<Row>, String> {
+    let tbl = get_table(schema, name)?;
+    let table = tbl.read();
+    let mut result = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if id < table.rows.len() {
+            result.push(table.rows[id].clone());
+        }
+    }
+    Ok(result)
 }
 
 #[allow(dead_code)]
