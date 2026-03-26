@@ -68,6 +68,7 @@ impl QueryArena {
     }
 
     /// Resolve an ArenaStr to &str.
+    #[inline(always)]
     pub fn get_str(&self, s: ArenaStr) -> &str {
         let start = s.offset as usize;
         let end = start + s.len as usize;
@@ -83,6 +84,12 @@ impl QueryArena {
             offset,
             len: v.len() as u32,
         }
+    }
+
+    /// Raw byte buffer access (for direct comparison).
+    #[inline(always)]
+    pub fn bytes_ref(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Resolve an ArenaVec to &[f32].
@@ -165,6 +172,7 @@ impl ArenaValue {
     }
 
     /// Compare two ArenaValues. Returns ordering or None for incompatible types.
+    #[inline]
     pub fn compare(&self, other: &Self, arena: &QueryArena) -> Option<std::cmp::Ordering> {
         use std::cmp::Ordering;
         match (self, other) {
@@ -193,6 +201,7 @@ impl ArenaValue {
     }
 
     /// Equality check with arena context.
+    #[inline]
     pub fn eq_with(&self, other: &Self, arena: &QueryArena) -> bool {
         match (self, other) {
             (ArenaValue::Null, ArenaValue::Null) => true,

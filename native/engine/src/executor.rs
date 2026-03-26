@@ -890,6 +890,7 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
     }
 }
 
+#[inline(always)]
 fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut QueryArena) -> Result<ArenaValue, String> {
     match node {
         NodeEnum::ColumnRef(cref) => {
@@ -1149,6 +1150,7 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
     }
 }
 
+#[inline(always)]
 fn eval_comparison_op(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &QueryArena) -> Result<ArenaValue, String> {
     if left.is_null() || right.is_null() {
         return Ok(ArenaValue::Null);
@@ -1397,6 +1399,7 @@ fn eval_bool_expr(
     }
 }
 
+#[inline(always)]
 fn eval_arithmetic(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &QueryArena) -> Result<ArenaValue, String> {
     if left.is_null() || right.is_null() {
         return Ok(ArenaValue::Null);
@@ -1586,17 +1589,19 @@ fn eval_where(
 
 /// Legacy eval_where for DML (DELETE/UPDATE) paths that use Value rows.
 /// Creates a local arena for the expression evaluation.
+/// DML bridge: evaluate WHERE clause on Value rows using a shared arena.
+/// The arena is reused across rows to avoid per-row 4KB allocation.
 fn eval_where_value(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
     row: &[Value],
     ctx: &JoinContext,
+    arena: &mut QueryArena,
 ) -> Result<bool, String> {
     match where_clause {
         Some(wc) => match wc.node.as_ref() {
             Some(expr) => {
-                let mut local_arena = QueryArena::new();
-                let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, &mut local_arena)).collect();
-                match eval_expr(expr, &arena_row, ctx, &mut local_arena)? {
+                let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, arena)).collect();
+                match eval_expr(expr, &arena_row, ctx, arena)? {
                     ArenaValue::Bool(b) => Ok(b),
                     ArenaValue::Null => Ok(false),
                     _ => Err("WHERE clause must return boolean".into()),
@@ -1608,12 +1613,11 @@ fn eval_where_value(
     }
 }
 
-/// Legacy eval_expr for DML paths that use Value rows.
-fn eval_expr_value(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value, String> {
-    let mut local_arena = QueryArena::new();
-    let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, &mut local_arena)).collect();
-    let result = eval_expr(node, &arena_row, ctx, &mut local_arena)?;
-    Ok(result.to_value(&local_arena))
+/// DML bridge: evaluate expression on Value rows using a shared arena.
+fn eval_expr_value(node: &NodeEnum, row: &[Value], ctx: &JoinContext, arena: &mut QueryArena) -> Result<Value, String> {
+    let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, arena)).collect();
+    let result = eval_expr(node, &arena_row, ctx, arena)?;
+    Ok(result.to_value(arena))
 }
 
 // ── Fast equality filter (Principle 4: vectorized WHERE) ─────────────
@@ -1633,27 +1637,26 @@ impl FastEqualityFilter {
         v.eq_with(&self.value, arena) || v.compare(&self.value, arena) == Some(std::cmp::Ordering::Equal)
     }
 
-    /// Match against Value rows (for scan_with which operates inside storage lock on Value rows).
+    /// Match against Value rows (for scan_with inside storage lock).
+    /// Zero allocation: compares Value directly against ArenaValue const.
     #[inline(always)]
     fn matches_value(&self, row: &[Value], arena: &QueryArena) -> bool {
         if self.col_idx >= row.len() { return false; }
-        // Convert the single value for comparison
-        let mut tmp_arena = QueryArena::new();
-        let av = ArenaValue::from_value(&row[self.col_idx], &mut tmp_arena);
-        // For Int/Float/Bool we can compare directly without arena
-        match (&av, &self.value) {
-            (ArenaValue::Int(a), ArenaValue::Int(b)) => a == b,
-            (ArenaValue::Float(a), ArenaValue::Float(b)) => a == b,
-            (ArenaValue::Bool(a), ArenaValue::Bool(b)) => a == b,
-            (ArenaValue::Int(a), ArenaValue::Float(b)) => (*a as f64) == *b,
-            (ArenaValue::Float(a), ArenaValue::Int(b)) => *a == (*b as f64),
-            (ArenaValue::Null, _) | (_, ArenaValue::Null) => false,
-            _ => {
-                // For text/vector, need to compare through arenas
-                let v_text = av.to_text(&tmp_arena);
-                let self_text = self.value.to_text(arena);
-                v_text == self_text
+        let v = &row[self.col_idx];
+        match (v, &self.value) {
+            (Value::Int(a), ArenaValue::Int(b)) => *a == *b,
+            (Value::Float(a), ArenaValue::Float(b)) => *a == *b,
+            (Value::Bool(a), ArenaValue::Bool(b)) => *a == *b,
+            (Value::Int(a), ArenaValue::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), ArenaValue::Int(b)) => *a == (*b as f64),
+            (Value::Null, _) | (_, ArenaValue::Null) => false,
+            (Value::Text(a), ArenaValue::Text(b)) => a.as_ref() == arena.get_str(*b),
+            (Value::Vector(a), ArenaValue::Vector(b)) => a.as_slice() == arena.get_vec(*b),
+            (Value::Bytea(a), ArenaValue::Bytea(b)) => {
+                let bs = b.offset as usize;
+                a.as_slice() == &arena.bytes_ref()[bs..bs + b.len as usize]
             }
+            _ => false,
         }
     }
 }
@@ -2501,8 +2504,10 @@ fn exec_select_raw(
                         }
                     }
                 } else {
+                    // Single arena shared across all rows (not per-row).
+                    let mut scan_arena = QueryArena::new();
                     for row in all_rows {
-                        if eval_where_value(&select.where_clause, row, &ctx)? {
+                        if eval_where_value(&select.where_clause, row, &ctx, &mut scan_arena)? {
                             filtered.push(row.clone());
                         }
                     }
@@ -3137,16 +3142,17 @@ fn exec_select_aggregate(
         columns_built = true;
     }
 
-    // HAVING filter
+    // HAVING filter — collect passing indices, then retain (no per-row clone).
     if let Some(having_node) = &select.having_clause {
         if let Some(having_expr) = having_node.node.as_ref() {
-            let mut filtered = Vec::new();
+            let mut keep = vec![false; result_rows.len()];
             for (i, (_, group_rows)) in groups.iter().enumerate() {
-                if eval_having(having_expr, group_rows, ctx, arena)? {
-                    filtered.push(result_rows[i].clone());
+                if i < keep.len() && eval_having(having_expr, group_rows, ctx, arena)? {
+                    keep[i] = true;
                 }
             }
-            result_rows = filtered;
+            let mut idx = 0;
+            result_rows.retain(|_| { let k = keep[idx]; idx += 1; k });
         }
     }
 
@@ -3435,25 +3441,27 @@ fn exec_delete(
 
     let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
-        // This catches expression errors (bad column refs, type mismatches) before mutation.
+        // Validate WHERE clause — single arena shared across all rows.
+        let mut validate_arena = QueryArena::new();
         storage::scan_with(schema, table_name, |all_rows| {
             for row in all_rows {
-                eval_where_value(&delete.where_clause, row, &ctx)?;
+                eval_where_value(&delete.where_clause, row, &ctx, &mut validate_arena)?;
             }
             Ok(())
         })?;
         if has_returning {
             let wc = delete.where_clause.clone();
+            let mut del_arena = QueryArena::new();
             let rows = storage::delete_where_returning(schema, table_name, |row| {
-                eval_where_value(&wc, row, &ctx).unwrap_or(false)
+                eval_where_value(&wc, row, &ctx, &mut del_arena).unwrap_or(false)
             })?;
             let n = rows.len() as u64;
             (n, rows)
         } else {
             let wc = delete.where_clause.clone();
+            let mut del_arena = QueryArena::new();
             let n = storage::delete_where(schema, table_name, |row| {
-                eval_where_value(&wc, row, &ctx).unwrap_or(false)
+                eval_where_value(&wc, row, &ctx, &mut del_arena).unwrap_or(false)
             })?;
             (n, vec![])
         }
@@ -3514,11 +3522,11 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
-    // This catches expression errors (bad column refs, type mismatches) before mutation.
+    // Validate WHERE clause — single arena shared across all rows.
+    let mut validate_arena = QueryArena::new();
     storage::scan_with(schema, table_name, |all_rows| {
         for row in all_rows {
-            eval_where_value(&update.where_clause, row, &ctx)?;
+            eval_where_value(&update.where_clause, row, &ctx, &mut validate_arena)?;
         }
         Ok(())
     })?;
@@ -3530,16 +3538,18 @@ fn exec_update(
 
     let has_returning = !update.returning_list.is_empty();
     let mut updated_rows: Vec<Vec<Value>> = Vec::new();
+    let mut pred_arena = QueryArena::new();
+    let mut expr_arena = QueryArena::new();
 
     let count = storage::update_rows_checked(
         schema,
         table_name,
-        |row| eval_where_value(&wc, row, &ctx2).unwrap_or(false),
+        |row| eval_where_value(&wc, row, &ctx2, &mut pred_arena).unwrap_or(false),
         |row| {
             let ctx_inner = JoinContext::single(schema, table_name, td.clone());
             let mut new_row = row.clone();
             for (col_idx, expr_node) in &assigns {
-                new_row[*col_idx] = eval_expr_value(expr_node, row, &ctx_inner)?;
+                new_row[*col_idx] = eval_expr_value(expr_node, row, &ctx_inner, &mut expr_arena)?;
             }
             check_not_null(&td, &new_row)?;
             if has_returning {
