@@ -133,12 +133,12 @@ pub fn delete_all(schema: &str, name: &str) -> Result<u64, String> {
 pub fn delete_where(
     schema: &str,
     name: &str,
-    predicate: impl Fn(&Row) -> bool,
+    mut predicate: impl FnMut(&Row) -> bool,
 ) -> Result<u64, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
     let before = table.rows.len();
-    table.rows.retain(|row| !predicate(row));
+    table.rows.retain_mut(|row| !predicate(row));
     let deleted = before - table.rows.len();
     if deleted > 0 {
         rebuild_indexes(&mut table);
@@ -151,12 +151,12 @@ pub fn delete_where(
 pub fn delete_where_returning(
     schema: &str,
     name: &str,
-    predicate: impl Fn(&Row) -> bool,
+    mut predicate: impl FnMut(&Row) -> bool,
 ) -> Result<Vec<Row>, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
     let mut deleted = Vec::new();
-    table.rows.retain(|row| {
+    table.rows.retain_mut(|row| {
         if predicate(row) {
             deleted.push(row.clone()); // clone only deleted rows
             false
@@ -346,7 +346,7 @@ pub fn insert_batch_checked(
 pub fn update_rows_checked(
     schema: &str,
     name: &str,
-    predicate: impl Fn(&Row) -> bool,
+    mut predicate: impl FnMut(&Row) -> bool,
     updater: impl FnMut(&Row) -> Result<Row, String>,
     validator: impl Fn(&Row, &[Row], usize) -> Result<(), String>,
 ) -> Result<u64, String> {

@@ -6,12 +6,14 @@
 //   unique columns for O(1) constraint validation. Phase 2 work (index engine).
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hasher};
 use std::sync::{Arc, LazyLock};
 
 use parking_lot::RwLock;
 use pg_query::NodeEnum;
 use serde::Serialize;
 
+use crate::arena::{ArenaValue, QueryArena, rows_to_arena};
 use crate::catalog::{self, Column, Table};
 use crate::storage;
 use crate::types::{TypeOid, Value};
@@ -525,6 +527,7 @@ fn eval_returning(
 
     // Evaluate RETURNING expressions against each affected row
     let mut rows = Vec::new();
+    let mut ret_arena = QueryArena::new();
     for row in affected_rows {
         let mut result_row = Vec::new();
         for target in &col_exprs {
@@ -540,7 +543,9 @@ fn eval_returning(
                     }
                 }
                 ReturningTarget::Expr(expr) => {
-                    eval_expr(expr, row, &ctx)?
+                    let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, &mut ret_arena)).collect();
+                    let arena_val = eval_expr(expr, &arena_row, &ctx, &mut ret_arena)?;
+                    arena_val.to_value(&ret_arena)
                 }
             };
             result_row.push(val.to_text());
@@ -884,14 +889,15 @@ fn eval_const(node: Option<&NodeEnum>) -> Value {
     }
 }
 
-fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value, String> {
+#[inline(always)]
+fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut QueryArena) -> Result<ArenaValue, String> {
     match node {
         NodeEnum::ColumnRef(cref) => {
             let idx = resolve_column(cref, ctx)?;
             if idx < row.len() {
-                Ok(row[idx].clone())
+                Ok(row[idx]) // ArenaValue is Copy
             } else if ctx.total_columns == 0 {
-                Ok(Value::Null) // no-FROM context (SELECT 1)
+                Ok(ArenaValue::Null) // no-FROM context (SELECT 1)
             } else {
                 Err(format!(
                     "internal error: column index {} out of range for row of width {}",
@@ -901,43 +907,53 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
         }
         NodeEnum::AConst(ac) => {
             if ac.isnull {
-                return Ok(Value::Null);
+                return Ok(ArenaValue::Null);
             }
             if let Some(val) = &ac.val {
                 match val {
-                    pg_query::protobuf::a_const::Val::Ival(i) => Ok(Value::Int(i.ival as i64)),
+                    pg_query::protobuf::a_const::Val::Ival(i) => Ok(ArenaValue::Int(i.ival as i64)),
                     pg_query::protobuf::a_const::Val::Fval(f) => f
                         .fval
                         .parse::<f64>()
-                        .map(Value::Float)
+                        .map(ArenaValue::Float)
                         .map_err(|e| e.to_string()),
                     pg_query::protobuf::a_const::Val::Sval(s) => {
                         let trimmed = s.sval.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            parse_vector_literal(trimmed)
+                            let v = parse_vector_literal(trimmed)?;
+                            if let Value::Vector(data) = v {
+                                Ok(ArenaValue::Vector(arena.alloc_vec(&data)))
+                            } else {
+                                Ok(ArenaValue::Null)
+                            }
                         } else {
-                            Ok(Value::Text(Arc::from(s.sval.as_str())))
+                            Ok(ArenaValue::Text(arena.alloc_str(&s.sval)))
                         }
                     }
-                    pg_query::protobuf::a_const::Val::Bsval(s) => Ok(Value::Text(Arc::from(s.bsval.as_str()))),
-                    pg_query::protobuf::a_const::Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
+                    pg_query::protobuf::a_const::Val::Bsval(s) => Ok(ArenaValue::Text(arena.alloc_str(&s.bsval))),
+                    pg_query::protobuf::a_const::Val::Boolval(b) => Ok(ArenaValue::Bool(b.boolval)),
                 }
             } else {
-                Ok(Value::Null)
+                Ok(ArenaValue::Null)
             }
         }
-        NodeEnum::Integer(i) => Ok(Value::Int(i.ival as i64)),
+        NodeEnum::Integer(i) => Ok(ArenaValue::Int(i.ival as i64)),
         NodeEnum::Float(f) => f
             .fval
             .parse::<f64>()
-            .map(Value::Float)
+            .map(ArenaValue::Float)
             .map_err(|e| e.to_string()),
         NodeEnum::String(s) => {
             let trimmed = s.sval.trim();
             if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                parse_vector_literal(trimmed)
+                let v = parse_vector_literal(trimmed)?;
+                if let Value::Vector(data) = v {
+                    Ok(ArenaValue::Vector(arena.alloc_vec(&data)))
+                } else {
+                    Ok(ArenaValue::Null)
+                }
             } else {
-                Ok(Value::Text(Arc::from(s.sval.as_str())))
+                Ok(ArenaValue::Text(arena.alloc_str(&s.sval)))
             }
         }
         NodeEnum::TypeCast(tc) => {
@@ -946,7 +962,7 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
-            let val = eval_expr(inner, row, ctx)?;
+            let val = eval_expr(inner, row, ctx, arena)?;
             // Handle cast to vector type
             if let Some(tn) = &tc.type_name {
                 let type_name: String = tn
@@ -963,33 +979,37 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                     .last()
                     .unwrap_or_default();
                 if type_name == "vector" {
-                    if let Value::Text(s) = &val {
-                        let trimmed = s.trim();
+                    if let ArenaValue::Text(s) = &val {
+                        let text = arena.get_str(*s).to_string();
+                        let trimmed = text.trim();
                         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            return parse_vector_literal(trimmed);
+                            let v = parse_vector_literal(trimmed)?;
+                            if let Value::Vector(data) = v {
+                                return Ok(ArenaValue::Vector(arena.alloc_vec(&data)));
+                            }
                         }
                     }
                 }
             }
             Ok(val)
         }
-        NodeEnum::AExpr(expr) => eval_a_expr(expr, row, ctx),
-        NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, ctx),
+        NodeEnum::AExpr(expr) => eval_a_expr(expr, row, ctx, arena),
+        NodeEnum::BoolExpr(bexpr) => eval_bool_expr(bexpr, row, ctx, arena),
         NodeEnum::NullTest(nt) => {
             let inner = nt
                 .arg
                 .as_ref()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("NullTest missing arg")?;
-            let val = eval_expr(inner, row, ctx)?;
-            let is_null = matches!(val, Value::Null);
+            let val = eval_expr(inner, row, ctx, arena)?;
+            let is_null = val.is_null();
             if nt.nulltesttype == pg_query::protobuf::NullTestType::IsNull as i32 {
-                Ok(Value::Bool(is_null))
+                Ok(ArenaValue::Bool(is_null))
             } else {
-                Ok(Value::Bool(!is_null))
+                Ok(ArenaValue::Bool(!is_null))
             }
         }
-        NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx),
+        NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx, arena),
         NodeEnum::SubLink(sl) => {
             let inner = sl
                 .subselect
@@ -1004,8 +1024,8 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                     // EXISTS
                     if sub_type == pg_query::protobuf::SubLinkType::ExistsSublink as i32 {
                         let (_cols, inner_rows) =
-                            exec_select_raw(sel, Some((row, ctx)))?;
-                        return Ok(Value::Bool(!inner_rows.is_empty()));
+                            exec_select_raw(sel, Some((row, ctx)), arena)?;
+                        return Ok(ArenaValue::Bool(!inner_rows.is_empty()));
                     }
 
                     // ANY / IN (sub_link_type = AnySublink)
@@ -1015,41 +1035,39 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                             .as_ref()
                             .and_then(|n| n.node.as_ref())
                             .ok_or("IN subquery missing test expression")?;
-                        let test_val = eval_expr(test_node, row, ctx)?;
+                        let test_val = eval_expr(test_node, row, ctx, arena)?;
 
                         let (cols, inner_rows) =
-                            exec_select_raw(sel, Some((row, ctx)))?;
+                            exec_select_raw(sel, Some((row, ctx)), arena)?;
 
                         // Validate: subquery must return exactly one column
                         if !cols.is_empty() && cols.len() != 1 {
                             return Err("subquery must return only one column".into());
                         }
 
-                        if matches!(test_val, Value::Null) {
-                            return Ok(Value::Null);
+                        if test_val.is_null() {
+                            return Ok(ArenaValue::Null);
                         }
 
                         let mut has_null = false;
                         for inner_row in &inner_rows {
                             let inner_val =
-                                inner_row.first().cloned().unwrap_or(Value::Null);
-                            if matches!(inner_val, Value::Null) {
+                                inner_row.first().copied().unwrap_or(ArenaValue::Null);
+                            if inner_val.is_null() {
                                 has_null = true;
                                 continue;
                             }
-                            // Use compare() for type coercion (Int vs Float)
-                            // and == for same-type equality
-                            let is_eq = test_val == inner_val
-                                || test_val.compare(&inner_val)
+                            let is_eq = test_val.eq_with(&inner_val, arena)
+                                || test_val.compare(&inner_val, arena)
                                     == Some(std::cmp::Ordering::Equal);
                             if is_eq {
-                                return Ok(Value::Bool(true));
+                                return Ok(ArenaValue::Bool(true));
                             }
                         }
                         return Ok(if has_null {
-                            Value::Null
+                            ArenaValue::Null
                         } else {
-                            Value::Bool(false)
+                            ArenaValue::Bool(false)
                         });
                     }
 
@@ -1060,17 +1078,17 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                             .as_ref()
                             .and_then(|n| n.node.as_ref())
                             .ok_or("ALL subquery missing test expression")?;
-                        let test_val = eval_expr(test_node, row, ctx)?;
+                        let test_val = eval_expr(test_node, row, ctx, arena)?;
 
                         let (_cols, inner_rows) =
-                            exec_select_raw(sel, Some((row, ctx)))?;
+                            exec_select_raw(sel, Some((row, ctx)), arena)?;
 
                         // NULL op ALL(empty) = TRUE, NULL op ALL(non-empty) = NULL
-                        if matches!(test_val, Value::Null) {
+                        if test_val.is_null() {
                             return Ok(if inner_rows.is_empty() {
-                                Value::Bool(true)
+                                ArenaValue::Bool(true)
                             } else {
-                                Value::Null
+                                ArenaValue::Null
                             });
                         }
 
@@ -1093,30 +1111,30 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
                         let mut has_null = false;
                         for inner_row in &inner_rows {
                             let inner_val =
-                                inner_row.first().cloned().unwrap_or(Value::Null);
+                                inner_row.first().copied().unwrap_or(ArenaValue::Null);
                             let cmp_result =
-                                eval_comparison_op(&op, &test_val, &inner_val)?;
+                                eval_comparison_op(&op, &test_val, &inner_val, arena)?;
                             match cmp_result {
-                                Value::Bool(true) => continue,
-                                Value::Bool(false) => return Ok(Value::Bool(false)),
+                                ArenaValue::Bool(true) => continue,
+                                ArenaValue::Bool(false) => return Ok(ArenaValue::Bool(false)),
                                 _ => has_null = true,
                             }
                         }
-                        return Ok(if has_null { Value::Null } else { Value::Bool(true) });
+                        return Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(true) });
                     }
 
                     // Scalar subquery (ExprSublink)
                     if sub_type == pg_query::protobuf::SubLinkType::ExprSublink as i32 {
                         let (_cols, inner_rows) =
-                            exec_select_raw(sel, Some((row, ctx)))?;
+                            exec_select_raw(sel, Some((row, ctx)), arena)?;
                         if inner_rows.len() > 1 {
                             return Err("more than one row returned by a subquery used as an expression".into());
                         }
                         return Ok(inner_rows
                             .first()
                             .and_then(|r| r.first())
-                            .cloned()
-                            .unwrap_or(Value::Null));
+                            .copied()
+                            .unwrap_or(ArenaValue::Null));
                     }
 
                     Err(format!("unsupported subquery type: {}", sub_type))
@@ -1131,11 +1149,12 @@ fn eval_expr(node: &NodeEnum, row: &[Value], ctx: &JoinContext) -> Result<Value,
     }
 }
 
-fn eval_comparison_op(op: &str, left: &Value, right: &Value) -> Result<Value, String> {
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return Ok(Value::Null);
+#[inline(always)]
+fn eval_comparison_op(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &QueryArena) -> Result<ArenaValue, String> {
+    if left.is_null() || right.is_null() {
+        return Ok(ArenaValue::Null);
     }
-    let cmp = left.compare(right);
+    let cmp = left.compare(right, arena);
     let result = match op {
         "=" => cmp.map(|o| o == std::cmp::Ordering::Equal),
         "<>" | "!=" => cmp.map(|o| o != std::cmp::Ordering::Equal),
@@ -1145,14 +1164,15 @@ fn eval_comparison_op(op: &str, left: &Value, right: &Value) -> Result<Value, St
         ">=" => cmp.map(|o| o != std::cmp::Ordering::Less),
         _ => return Err(format!("unsupported operator in ALL: {}", op)),
     };
-    Ok(result.map(Value::Bool).unwrap_or(Value::Null))
+    Ok(result.map(ArenaValue::Bool).unwrap_or(ArenaValue::Null))
 }
 
 fn eval_a_expr(
     expr: &pg_query::protobuf::AExpr,
-    row: &[Value],
+    row: &[ArenaValue],
     ctx: &JoinContext,
-) -> Result<Value, String> {
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
     // Handle IN / NOT IN literal lists (AexprIn)
     if expr.kind == pg_query::protobuf::AExprKind::AexprIn as i32 {
         let in_op = extract_op_name(&expr.name).unwrap_or_default();
@@ -1163,10 +1183,10 @@ fn eval_a_expr(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or("IN missing left operand")?;
-        let left_val = eval_expr(left_node, row, ctx)?;
+        let left_val = eval_expr(left_node, row, ctx, arena)?;
 
-        if matches!(left_val, Value::Null) {
-            return Ok(Value::Null);
+        if left_val.is_null() {
+            return Ok(ArenaValue::Null);
         }
 
         // rexpr is a List of values
@@ -1180,22 +1200,22 @@ fn eval_a_expr(
             let mut has_null = false;
             for item in &list.items {
                 if let Some(item_node) = item.node.as_ref() {
-                    let item_val = eval_expr(item_node, row, ctx)?;
-                    if matches!(item_val, Value::Null) {
+                    let item_val = eval_expr(item_node, row, ctx, arena)?;
+                    if item_val.is_null() {
                         has_null = true;
                         continue;
                     }
-                    let is_eq = left_val == item_val
-                        || left_val.compare(&item_val) == Some(std::cmp::Ordering::Equal);
+                    let is_eq = left_val.eq_with(&item_val, arena)
+                        || left_val.compare(&item_val, arena) == Some(std::cmp::Ordering::Equal);
                     if is_eq {
-                        return Ok(Value::Bool(!negated));
+                        return Ok(ArenaValue::Bool(!negated));
                     }
                 }
             }
             return Ok(if has_null {
-                Value::Null
+                ArenaValue::Null
             } else {
-                Value::Bool(negated)
+                ArenaValue::Bool(negated)
             });
         }
 
@@ -1211,12 +1231,12 @@ fn eval_a_expr(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or("unary - missing operand")?;
-        return match eval_expr(right, row, ctx)? {
-            Value::Int(n) => Ok(Value::Int(
+        return match eval_expr(right, row, ctx, arena)? {
+            ArenaValue::Int(n) => Ok(ArenaValue::Int(
                 n.checked_neg().ok_or("integer out of range")?,
             )),
-            Value::Float(f) => Ok(Value::Float(-f)),
-            Value::Null => Ok(Value::Null),
+            ArenaValue::Float(f) => Ok(ArenaValue::Float(-f)),
+            ArenaValue::Null => Ok(ArenaValue::Null),
             _ => Err("unary minus requires numeric".into()),
         };
     }
@@ -1232,84 +1252,81 @@ fn eval_a_expr(
         .and_then(|n| n.node.as_ref())
         .ok_or("A_Expr missing right operand")?;
 
-    let left = eval_expr(left_node, row, ctx)?;
-    let right = eval_expr(right_node, row, ctx)?;
+    let left = eval_expr(left_node, row, ctx, arena)?;
+    let right = eval_expr(right_node, row, ctx, arena)?;
 
     // String concatenation
     if op == "||" {
         return match (&left, &right) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (ArenaValue::Null, _) | (_, ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => {
-                let l = left.to_text().unwrap_or_default();
-                let r = right.to_text().unwrap_or_default();
-                Ok(Value::Text(Arc::from(format!("{}{}", l, r).as_str())))
+                let l = left.to_text(arena).unwrap_or_default();
+                let r = right.to_text(arena).unwrap_or_default();
+                let combined = format!("{}{}", l, r);
+                Ok(ArenaValue::Text(arena.alloc_str(&combined)))
             }
         };
     }
 
     // Arithmetic
     if matches!(op.as_str(), "+" | "-" | "*" | "/") {
-        return eval_arithmetic(&op, &left, &right);
+        return eval_arithmetic(&op, &left, &right, arena);
     }
 
     // Vector distance operators (return Float, not Bool — no NULL propagation needed here)
     match op.as_str() {
         "<->" => {
             return match (&left, &right) {
-                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    // Single-pass sum-of-squared-differences — no intermediate
-                    // allocation, no branches in inner loop → SIMD-friendly.
-                    let dist_sq: f32 = a.iter().zip(b.iter())
+                (ArenaValue::Null, _) | (_, ArenaValue::Null) => Ok(ArenaValue::Null),
+                (ArenaValue::Vector(a), ArenaValue::Vector(b)) => {
+                    let va = arena.get_vec(*a);
+                    let vb = arena.get_vec(*b);
+                    if va.len() != vb.len() {
+                        return Err(format!("different vector dimensions {} and {}", va.len(), vb.len()));
+                    }
+                    let dist_sq: f32 = va.iter().zip(vb.iter())
                         .map(|(x, y)| { let d = x - y; d * d })
                         .sum();
-                    Ok(Value::Float(dist_sq.sqrt() as f64))
+                    Ok(ArenaValue::Float(dist_sq.sqrt() as f64))
                 }
-                (Value::Vector(a), Value::Vector(b)) => Err(format!(
-                    "different vector dimensions {} and {}",
-                    a.len(),
-                    b.len()
-                )),
                 _ => Err("operator <-> requires vector operands".into()),
             };
         }
         "<=>" => {
             return match (&left, &right) {
-                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    // Single-pass cosine: dot product + both norms in one
-                    // iteration — 3x fewer passes, no branches → SIMD-friendly.
-                    let (dot, norm_a_sq, norm_b_sq) = a.iter().zip(b.iter())
+                (ArenaValue::Null, _) | (_, ArenaValue::Null) => Ok(ArenaValue::Null),
+                (ArenaValue::Vector(a), ArenaValue::Vector(b)) => {
+                    let va = arena.get_vec(*a);
+                    let vb = arena.get_vec(*b);
+                    if va.len() != vb.len() {
+                        return Err(format!("different vector dimensions {} and {}", va.len(), vb.len()));
+                    }
+                    let (dot, norm_a_sq, norm_b_sq) = va.iter().zip(vb.iter())
                         .fold((0.0f32, 0.0f32, 0.0f32), |(d, na, nb), (x, y)| {
                             (d + x * y, na + x * x, nb + y * y)
                         });
                     let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
                     if denom == 0.0 {
-                        Ok(Value::Float(1.0))
+                        Ok(ArenaValue::Float(1.0))
                     } else {
-                        Ok(Value::Float((1.0 - dot / denom) as f64))
+                        Ok(ArenaValue::Float((1.0 - dot / denom) as f64))
                     }
                 }
-                (Value::Vector(a), Value::Vector(b)) => Err(format!(
-                    "different vector dimensions {} and {}",
-                    a.len(),
-                    b.len()
-                )),
                 _ => Err("operator <=> requires vector operands".into()),
             };
         }
         "<#>" => {
             return match (&left, &right) {
-                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Vector(a), Value::Vector(b)) if a.len() == b.len() => {
-                    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-                    Ok(Value::Float((-dot) as f64))
+                (ArenaValue::Null, _) | (_, ArenaValue::Null) => Ok(ArenaValue::Null),
+                (ArenaValue::Vector(a), ArenaValue::Vector(b)) => {
+                    let va = arena.get_vec(*a);
+                    let vb = arena.get_vec(*b);
+                    if va.len() != vb.len() {
+                        return Err(format!("different vector dimensions {} and {}", va.len(), vb.len()));
+                    }
+                    let dot: f32 = va.iter().zip(vb.iter()).map(|(x, y)| x * y).sum();
+                    Ok(ArenaValue::Float((-dot) as f64))
                 }
-                (Value::Vector(a), Value::Vector(b)) => Err(format!(
-                    "different vector dimensions {} and {}",
-                    a.len(),
-                    b.len()
-                )),
                 _ => Err("operator <#> requires vector operands".into()),
             };
         }
@@ -1317,11 +1334,11 @@ fn eval_a_expr(
     }
 
     // NULL propagation for comparisons
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return Ok(Value::Null);
+    if left.is_null() || right.is_null() {
+        return Ok(ArenaValue::Null);
     }
 
-    let cmp = left.compare(&right);
+    let cmp = left.compare(&right, arena);
     let result = match op.as_str() {
         "=" => cmp.map(|o| o == std::cmp::Ordering::Equal),
         "<>" | "!=" => cmp.map(|o| o != std::cmp::Ordering::Equal),
@@ -1331,48 +1348,49 @@ fn eval_a_expr(
         ">=" => cmp.map(|o| o != std::cmp::Ordering::Less),
         _ => return Err(format!("unsupported operator: {}", op)),
     };
-    Ok(result.map(Value::Bool).unwrap_or(Value::Null))
+    Ok(result.map(ArenaValue::Bool).unwrap_or(ArenaValue::Null))
 }
 
 fn eval_bool_expr(
     bexpr: &pg_query::protobuf::BoolExpr,
-    row: &[Value],
+    row: &[ArenaValue],
     ctx: &JoinContext,
-) -> Result<Value, String> {
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
     let boolop = bexpr.boolop;
     if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
         let mut has_null = false;
         for arg in &bexpr.args {
             let inner = arg.node.as_ref().ok_or("BoolExpr: missing arg")?;
-            match eval_expr(inner, row, ctx)? {
-                Value::Bool(false) => return Ok(Value::Bool(false)),
-                Value::Null => has_null = true,
-                Value::Bool(true) => {}
+            match eval_expr(inner, row, ctx, arena)? {
+                ArenaValue::Bool(false) => return Ok(ArenaValue::Bool(false)),
+                ArenaValue::Null => has_null = true,
+                ArenaValue::Bool(true) => {}
                 other => return Err(format!("AND expects bool, got {:?}", other)),
             }
         }
-        Ok(if has_null { Value::Null } else { Value::Bool(true) })
+        Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(true) })
     } else if boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
         let mut has_null = false;
         for arg in &bexpr.args {
             let inner = arg.node.as_ref().ok_or("BoolExpr: missing arg")?;
-            match eval_expr(inner, row, ctx)? {
-                Value::Bool(true) => return Ok(Value::Bool(true)),
-                Value::Null => has_null = true,
-                Value::Bool(false) => {}
+            match eval_expr(inner, row, ctx, arena)? {
+                ArenaValue::Bool(true) => return Ok(ArenaValue::Bool(true)),
+                ArenaValue::Null => has_null = true,
+                ArenaValue::Bool(false) => {}
                 other => return Err(format!("OR expects bool, got {:?}", other)),
             }
         }
-        Ok(if has_null { Value::Null } else { Value::Bool(false) })
+        Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(false) })
     } else if boolop == pg_query::protobuf::BoolExprType::NotExpr as i32 {
         let inner = bexpr
             .args
             .first()
             .and_then(|a| a.node.as_ref())
             .ok_or("NOT missing arg")?;
-        match eval_expr(inner, row, ctx)? {
-            Value::Bool(b) => Ok(Value::Bool(!b)),
-            Value::Null => Ok(Value::Null),
+        match eval_expr(inner, row, ctx, arena)? {
+            ArenaValue::Bool(b) => Ok(ArenaValue::Bool(!b)),
+            ArenaValue::Null => Ok(ArenaValue::Null),
             other => Err(format!("NOT expects bool, got {:?}", other)),
         }
     } else {
@@ -1380,50 +1398,51 @@ fn eval_bool_expr(
     }
 }
 
-fn eval_arithmetic(op: &str, left: &Value, right: &Value) -> Result<Value, String> {
-    if matches!(left, Value::Null) || matches!(right, Value::Null) {
-        return Ok(Value::Null);
+#[inline(always)]
+fn eval_arithmetic(op: &str, left: &ArenaValue, right: &ArenaValue, arena: &QueryArena) -> Result<ArenaValue, String> {
+    if left.is_null() || right.is_null() {
+        return Ok(ArenaValue::Null);
     }
     match (left, right) {
-        (Value::Int(a), Value::Int(b)) => match op {
-            "+" => Ok(Value::Int(
+        (ArenaValue::Int(a), ArenaValue::Int(b)) => match op {
+            "+" => Ok(ArenaValue::Int(
                 a.checked_add(*b).ok_or("integer out of range")?,
             )),
-            "-" => Ok(Value::Int(
+            "-" => Ok(ArenaValue::Int(
                 a.checked_sub(*b).ok_or("integer out of range")?,
             )),
-            "*" => Ok(Value::Int(
+            "*" => Ok(ArenaValue::Int(
                 a.checked_mul(*b).ok_or("integer out of range")?,
             )),
             "/" => {
                 if *b == 0 {
                     Err("division by zero".into())
                 } else {
-                    Ok(Value::Int(
+                    Ok(ArenaValue::Int(
                         a.checked_div(*b).ok_or("integer out of range")?,
                     ))
                 }
             }
             _ => Err(format!("unsupported arithmetic op: {}", op)),
         },
-        (Value::Float(a), Value::Float(b)) => match op {
-            "+" => Ok(Value::Float(a + b)),
-            "-" => Ok(Value::Float(a - b)),
-            "*" => Ok(Value::Float(a * b)),
+        (ArenaValue::Float(a), ArenaValue::Float(b)) => match op {
+            "+" => Ok(ArenaValue::Float(a + b)),
+            "-" => Ok(ArenaValue::Float(a - b)),
+            "*" => Ok(ArenaValue::Float(a * b)),
             "/" => {
                 if *b == 0.0 {
                     Err("division by zero".into())
                 } else {
-                    Ok(Value::Float(a / b))
+                    Ok(ArenaValue::Float(a / b))
                 }
             }
             _ => Err(format!("unsupported arithmetic op: {}", op)),
         },
-        (Value::Int(a), Value::Float(b)) => {
-            eval_arithmetic(op, &Value::Float(*a as f64), &Value::Float(*b))
+        (ArenaValue::Int(a), ArenaValue::Float(b)) => {
+            eval_arithmetic(op, &ArenaValue::Float(*a as f64), &ArenaValue::Float(*b), arena)
         }
-        (Value::Float(a), Value::Int(b)) => {
-            eval_arithmetic(op, &Value::Float(*a), &Value::Float(*b as f64))
+        (ArenaValue::Float(a), ArenaValue::Int(b)) => {
+            eval_arithmetic(op, &ArenaValue::Float(*a), &ArenaValue::Float(*b as f64), arena)
         }
         _ => Err(format!("cannot apply {} to {:?} and {:?}", op, left, right)),
     }
@@ -1431,14 +1450,15 @@ fn eval_arithmetic(op: &str, left: &Value, right: &Value) -> Result<Value, Strin
 
 fn eval_func_call(
     fc: &pg_query::protobuf::FuncCall,
-    row: &[Value],
+    row: &[ArenaValue],
     ctx: &JoinContext,
-) -> Result<Value, String> {
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
     let name = extract_func_name(fc);
 
     // Aggregate functions are handled in exec_select_aggregate, not here.
     // If we reach here, it's a scalar function.
-    let args: Vec<Value> = fc
+    let args: Vec<ArenaValue> = fc
         .args
         .iter()
         .map(|a| {
@@ -1446,11 +1466,12 @@ fn eval_func_call(
                 a.node.as_ref().ok_or("FuncCall: missing arg")?,
                 row,
                 ctx,
+                arena,
             )
         })
         .collect::<Result<_, _>>()?;
 
-    eval_scalar_function(&name, &args)
+    eval_scalar_function(&name, &args, arena)
 }
 
 /// Parse a sequence name that may be schema-qualified ("public.myseq" or just "myseq").
@@ -1472,64 +1493,73 @@ fn parse_seq_name(s: &str) -> (&str, &str) {
     }
 }
 
-fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
+fn eval_scalar_function(name: &str, args: &[ArenaValue], arena: &mut QueryArena) -> Result<ArenaValue, String> {
     match name {
         "upper" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::Text(Arc::from(s.to_uppercase().as_str()))),
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Text(s)) => {
+                let upper = arena.get_str(*s).to_uppercase();
+                Ok(ArenaValue::Text(arena.alloc_str(&upper)))
+            }
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("upper() requires text argument".into()),
         },
         "lower" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::Text(Arc::from(s.to_lowercase().as_str()))),
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Text(s)) => {
+                let lower = arena.get_str(*s).to_lowercase();
+                Ok(ArenaValue::Text(arena.alloc_str(&lower)))
+            }
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("lower() requires text argument".into()),
         },
         "length" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::Int(s.len() as i64)),
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Text(s)) => Ok(ArenaValue::Int(arena.get_str(*s).len() as i64)),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("length() requires text argument".into()),
         },
         "concat" => {
             let parts: String = args
                 .iter()
                 .map(|v| match v {
-                    Value::Null => String::new(),
-                    v => v.to_text().unwrap_or_default(),
+                    ArenaValue::Null => String::new(),
+                    v => v.to_text(arena).unwrap_or_default(),
                 })
                 .collect();
-            Ok(Value::Text(Arc::from(parts.as_str())))
+            Ok(ArenaValue::Text(arena.alloc_str(&parts)))
         }
         "abs" => match args.first() {
-            Some(Value::Int(n)) => Ok(Value::Int(
+            Some(ArenaValue::Int(n)) => Ok(ArenaValue::Int(
                 n.checked_abs().ok_or("integer out of range")?,
             )),
-            Some(Value::Float(f)) => Ok(Value::Float(f.abs())),
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Float(f)) => Ok(ArenaValue::Float(f.abs())),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("abs() requires numeric argument".into()),
         },
         "nextval" => match args.first() {
-            Some(Value::Text(s)) => {
-                let (schema, name) = parse_seq_name(s);
+            Some(ArenaValue::Text(s)) => {
+                let text = arena.get_str(*s).to_string();
+                let (schema, name) = parse_seq_name(&text);
                 let val = crate::sequence::nextval(schema, name)?;
-                Ok(Value::Int(val))
+                Ok(ArenaValue::Int(val))
             }
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("nextval() requires text argument".into()),
         },
         "currval" => match args.first() {
-            Some(Value::Text(s)) => {
-                let (schema, name) = parse_seq_name(s);
+            Some(ArenaValue::Text(s)) => {
+                let text = arena.get_str(*s).to_string();
+                let (schema, name) = parse_seq_name(&text);
                 let val = crate::sequence::currval(schema, name)?;
-                Ok(Value::Int(val))
+                Ok(ArenaValue::Int(val))
             }
-            Some(Value::Null) => Ok(Value::Null),
+            Some(ArenaValue::Null) => Ok(ArenaValue::Null),
             _ => Err("currval() requires text argument".into()),
         },
         "setval" => match (args.first(), args.get(1)) {
-            (Some(Value::Text(s)), Some(Value::Int(v))) => {
-                let (schema, name) = parse_seq_name(s);
+            (Some(ArenaValue::Text(s)), Some(ArenaValue::Int(v))) => {
+                let text = arena.get_str(*s).to_string();
+                let (schema, name) = parse_seq_name(&text);
                 let val = crate::sequence::setval(schema, name, *v)?;
-                Ok(Value::Int(val))
+                Ok(ArenaValue::Int(val))
             }
             _ => Err("setval() requires (text, integer) arguments".into()),
         },
@@ -1539,14 +1569,15 @@ fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value, String> {
 
 fn eval_where(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
-    row: &[Value],
+    row: &[ArenaValue],
     ctx: &JoinContext,
+    arena: &mut QueryArena,
 ) -> Result<bool, String> {
     match where_clause {
         Some(wc) => match wc.node.as_ref() {
-            Some(expr) => match eval_expr(expr, row, ctx)? {
-                Value::Bool(b) => Ok(b),
-                Value::Null => Ok(false), // NULL in WHERE filters out the row
+            Some(expr) => match eval_expr(expr, row, ctx, arena)? {
+                ArenaValue::Bool(b) => Ok(b),
+                ArenaValue::Null => Ok(false), // NULL in WHERE filters out the row
                 _ => Err("WHERE clause must return boolean".into()),
             },
             None => Ok(true),
@@ -1555,22 +1586,77 @@ fn eval_where(
     }
 }
 
+/// Legacy eval_where for DML (DELETE/UPDATE) paths that use Value rows.
+/// Creates a local arena for the expression evaluation.
+/// DML bridge: evaluate WHERE clause on Value rows using a shared arena.
+/// The arena is reused across rows to avoid per-row 4KB allocation.
+fn eval_where_value(
+    where_clause: &Option<Box<pg_query::protobuf::Node>>,
+    row: &[Value],
+    ctx: &JoinContext,
+    arena: &mut QueryArena,
+) -> Result<bool, String> {
+    match where_clause {
+        Some(wc) => match wc.node.as_ref() {
+            Some(expr) => {
+                let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, arena)).collect();
+                match eval_expr(expr, &arena_row, ctx, arena)? {
+                    ArenaValue::Bool(b) => Ok(b),
+                    ArenaValue::Null => Ok(false),
+                    _ => Err("WHERE clause must return boolean".into()),
+                }
+            }
+            None => Ok(true),
+        },
+        None => Ok(true),
+    }
+}
+
+/// DML bridge: evaluate expression on Value rows using a shared arena.
+fn eval_expr_value(node: &NodeEnum, row: &[Value], ctx: &JoinContext, arena: &mut QueryArena) -> Result<Value, String> {
+    let arena_row: Vec<ArenaValue> = row.iter().map(|v| ArenaValue::from_value(v, arena)).collect();
+    let result = eval_expr(node, &arena_row, ctx, arena)?;
+    Ok(result.to_value(arena))
+}
+
 // ── Fast equality filter (Principle 4: vectorized WHERE) ─────────────
 
 /// Bypass eval_expr for the most common WHERE pattern: `column = constant`.
 /// Direct column-index comparison with zero AST walking overhead.
 struct FastEqualityFilter {
     col_idx: usize,
-    value: Value,
+    value: ArenaValue,
 }
 
 impl FastEqualityFilter {
     #[inline(always)]
-    fn matches(&self, row: &[Value]) -> bool {
+    fn matches(&self, row: &[ArenaValue], arena: &QueryArena) -> bool {
         if self.col_idx >= row.len() { return false; }
         let v = &row[self.col_idx];
-        // Use both == (same-type fast path) and compare() (cross-type: Int vs Float)
-        *v == self.value || v.compare(&self.value) == Some(std::cmp::Ordering::Equal)
+        v.eq_with(&self.value, arena) || v.compare(&self.value, arena) == Some(std::cmp::Ordering::Equal)
+    }
+
+    /// Match against Value rows (for scan_with inside storage lock).
+    /// Zero allocation: compares Value directly against ArenaValue const.
+    #[inline(always)]
+    fn matches_value(&self, row: &[Value], arena: &QueryArena) -> bool {
+        if self.col_idx >= row.len() { return false; }
+        let v = &row[self.col_idx];
+        match (v, &self.value) {
+            (Value::Int(a), ArenaValue::Int(b)) => *a == *b,
+            (Value::Float(a), ArenaValue::Float(b)) => *a == *b,
+            (Value::Bool(a), ArenaValue::Bool(b)) => *a == *b,
+            (Value::Int(a), ArenaValue::Float(b)) => (*a as f64) == *b,
+            (Value::Float(a), ArenaValue::Int(b)) => *a == (*b as f64),
+            (Value::Null, _) | (_, ArenaValue::Null) => false,
+            (Value::Text(a), ArenaValue::Text(b)) => a.as_ref() == arena.get_str(*b),
+            (Value::Vector(a), ArenaValue::Vector(b)) => a.as_slice() == arena.get_vec(*b),
+            (Value::Bytea(a), ArenaValue::Bytea(b)) => {
+                let bs = b.offset as usize;
+                a.as_slice() == &arena.bytes_ref()[bs..bs + b.len as usize]
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1580,6 +1666,7 @@ impl FastEqualityFilter {
 fn try_fast_equality_filter(
     where_clause: &Option<Box<pg_query::protobuf::Node>>,
     ctx: &JoinContext,
+    arena: &mut QueryArena,
 ) -> Option<FastEqualityFilter> {
     let wc = where_clause.as_ref()?;
     let node = wc.node.as_ref()?;
@@ -1595,15 +1682,17 @@ fn try_fast_equality_filter(
         // Pattern: ColumnRef = Constant
         if let NodeEnum::ColumnRef(cref) = left {
             let col_idx = resolve_column(cref, ctx).ok()?;
-            let value = eval_const(Some(right));
-            if matches!(value, Value::Null) { return None; } // NULL = x is never true
+            let val = eval_const(Some(right));
+            if matches!(val, Value::Null) { return None; } // NULL = x is never true
+            let value = ArenaValue::from_value(&val, arena);
             return Some(FastEqualityFilter { col_idx, value });
         }
         // Pattern: Constant = ColumnRef
         if let NodeEnum::ColumnRef(cref) = right {
             let col_idx = resolve_column(cref, ctx).ok()?;
-            let value = eval_const(Some(left));
-            if matches!(value, Value::Null) { return None; }
+            let val = eval_const(Some(left));
+            if matches!(val, Value::Null) { return None; }
+            let value = ArenaValue::from_value(&val, arena);
             return Some(FastEqualityFilter { col_idx, value });
         }
     }
@@ -1779,7 +1868,7 @@ fn query_has_aggregates(select: &pg_query::protobuf::SelectStmt) -> bool {
 
 // ── FROM clause execution (handles single table, JOINs, implicit joins) ──
 
-fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), String> {
+fn execute_from(node: &NodeEnum, arena: &mut QueryArena) -> Result<(Vec<Vec<ArenaValue>>, JoinContext), String> {
     match node {
         NodeEnum::RangeVar(rv) => {
             let alias = rv
@@ -1794,11 +1883,9 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
             };
             let table_def = catalog::get_table(schema, &rv.relname)
                 .ok_or_else(|| format!("relation \"{}\" does not exist", rv.relname))?;
-            // JOIN path: scan() (clone) is required here because rows must be owned
-            // to combine with rows from other tables in the JOIN. scan_with() would
-            // hold the read lock, preventing concurrent access to other tables and
-            // making multi-table lock acquisition deadlock-prone.
-            let rows = storage::scan(schema, &rv.relname)?;
+            // JOIN path: scan and convert to ArenaValue
+            let value_rows = storage::scan(schema, &rv.relname)?;
+            let rows = rows_to_arena(&value_rows, arena);
             let ncols = table_def.columns.len();
             let ctx = JoinContext {
                 sources: vec![JoinSource {
@@ -1823,8 +1910,8 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
                 .ok_or("JOIN missing right")?;
-            let (left_rows, left_ctx) = execute_from(left_node)?;
-            let (right_rows, right_ctx) = execute_from(right_node)?;
+            let (left_rows, left_ctx) = execute_from(left_node, arena)?;
+            let (right_rows, right_ctx) = execute_from(right_node, arena)?;
 
             // Merge contexts — shift right offsets
             let left_width = left_ctx.total_columns;
@@ -1852,13 +1939,13 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
             // MySQL-style: hash join for equi-joins, nested loop for theta/cross.
             let result = match try_equi_hash_join(
                 &left_rows, &right_rows, je.jointype,
-                quals, &merged, left_width, right_width,
+                quals, &merged, left_width, right_width, arena,
             ) {
                 Some(Ok(rows)) => rows,
                 Some(Err(e)) => return Err(e),
                 None => nested_loop_join(
                     &left_rows, &right_rows, je.jointype,
-                    quals, &merged, left_width, right_width,
+                    quals, &merged, left_width, right_width, arena,
                 )?,
             };
 
@@ -1875,7 +1962,7 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
                 return Err("subquery in FROM is not a SELECT".into());
             };
 
-            let (inner_cols, rows) = exec_select_raw(sel, None)?;
+            let (inner_cols, rows) = exec_select_raw(sel, None, arena)?;
             let alias = rs
                 .alias
                 .as_ref()
@@ -1922,21 +2009,22 @@ fn execute_from(node: &NodeEnum) -> Result<(Vec<Vec<Value>>, JoinContext), Strin
 /// Returns None if the ON clause isn't a simple equi-join.
 /// Returns Some(Ok(rows)) on success, Some(Err) on execution error.
 fn try_equi_hash_join(
-    left_rows: &[Vec<Value>],
-    right_rows: &[Vec<Value>],
+    left_rows: &[Vec<ArenaValue>],
+    right_rows: &[Vec<ArenaValue>],
     join_type: i32,
     quals: Option<&NodeEnum>,
     ctx: &JoinContext,
     left_width: usize,
     right_width: usize,
-) -> Option<Result<Vec<Vec<Value>>, String>> {
+    arena: &mut QueryArena,
+) -> Option<Result<Vec<Vec<ArenaValue>>, String>> {
     // Extract equi-join key columns from the ON clause
     let quals = quals?;
     let (left_col, right_col) = extract_equi_cols(quals, ctx)?;
 
     Some(execute_hash_join(
         left_rows, right_rows, join_type, ctx,
-        left_width, right_width, left_col, right_col,
+        left_width, right_width, left_col, right_col, arena,
     ))
 }
 
@@ -1976,17 +2064,18 @@ fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usiz
 
 /// Hash join: build hash table on right side, probe with left side. O(N+M).
 fn execute_hash_join(
-    left_rows: &[Vec<Value>],
-    right_rows: &[Vec<Value>],
+    left_rows: &[Vec<ArenaValue>],
+    right_rows: &[Vec<ArenaValue>],
     join_type: i32,
     ctx: &JoinContext,
     left_width: usize,
     right_width: usize,
     left_key_col: usize,
     right_key_col: usize,
-) -> Result<Vec<Vec<Value>>, String> {
-    let null_right = vec![Value::Null; right_width];
-    let null_left = vec![Value::Null; left_width];
+    arena: &mut QueryArena,
+) -> Result<Vec<Vec<ArenaValue>>, String> {
+    let null_right = vec![ArenaValue::Null; right_width];
+    let null_left = vec![ArenaValue::Null; left_width];
 
     let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
         || join_type == pg_query::protobuf::JoinType::Undefined as i32;
@@ -2006,20 +2095,23 @@ fn execute_hash_join(
         (right_key_col, left_key_col) // swap
     } else {
         // Both on same side — can't hash join this, fall back
-        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width);
+        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width, arena);
     };
     let right_local_key = right_key_col - left_width;
 
-    // BUILD phase: hash table on right side, keyed by join column value
+    // BUILD phase: hash table on right side using u64 hash (avoids borrow issues)
     // Skip NULL keys — in SQL, NULL = NULL is FALSE in JOIN ON conditions.
-    let mut hash_table: HashMap<Value, Vec<usize>> = HashMap::new();
+    let mut hash_table: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, row) in right_rows.iter().enumerate() {
         if right_local_key < row.len() {
-            if matches!(row[right_local_key], Value::Null) {
+            let key = row[right_local_key];
+            if key.is_null() {
                 continue; // NULL never matches in JOIN ON
             }
-            let key = row[right_local_key].clone();
-            hash_table.entry(key).or_default().push(i);
+            let mut hasher = DefaultHasher::new();
+            key.hash_with(arena, &mut hasher);
+            let h = hasher.finish();
+            hash_table.entry(h).or_default().push(i);
         }
     }
 
@@ -2033,13 +2125,13 @@ fn execute_hash_join(
         Vec::new()
     };
 
-    // PROBE phase: for each left row, look up matching right rows in O(1)
+    // PROBE phase: for each left row, look up matching right rows
     for left in left_rows {
         if left_key_col >= left.len() { continue; }
-        let key = &left[left_key_col];
+        let key = left[left_key_col];
 
         // NULL key never matches — treat as unmatched for LEFT/FULL joins
-        if matches!(key, Value::Null) {
+        if key.is_null() {
             if is_left || is_full {
                 let mut row = Vec::with_capacity(combined_width);
                 row.extend_from_slice(left);
@@ -2051,8 +2143,16 @@ fn execute_hash_join(
 
         let mut left_matched = false;
 
-        if let Some(indices) = hash_table.get(key) {
+        let mut hasher = DefaultHasher::new();
+        key.hash_with(arena, &mut hasher);
+        let h = hasher.finish();
+
+        if let Some(indices) = hash_table.get(&h) {
             for &ri in indices {
+                // Verify equality (hash collision check)
+                if !key.eq_with(&right_rows[ri][right_local_key], arena) {
+                    continue;
+                }
                 left_matched = true;
                 if !right_matched.is_empty() {
                     right_matched[ri] = true;
@@ -2088,16 +2188,17 @@ fn execute_hash_join(
 }
 
 fn nested_loop_join(
-    left_rows: &[Vec<Value>],
-    right_rows: &[Vec<Value>],
+    left_rows: &[Vec<ArenaValue>],
+    right_rows: &[Vec<ArenaValue>],
     join_type: i32,
     quals: Option<&NodeEnum>,
     ctx: &JoinContext,
     left_width: usize,
     right_width: usize,
-) -> Result<Vec<Vec<Value>>, String> {
-    let null_right = vec![Value::Null; right_width];
-    let null_left = vec![Value::Null; left_width];
+    arena: &mut QueryArena,
+) -> Result<Vec<Vec<ArenaValue>>, String> {
+    let null_right = vec![ArenaValue::Null; right_width];
+    let null_left = vec![ArenaValue::Null; left_width];
     let mut result = Vec::with_capacity(left_rows.len());
     let is_inner = join_type == pg_query::protobuf::JoinType::JoinInner as i32
         || join_type == pg_query::protobuf::JoinType::Undefined as i32;
@@ -2122,7 +2223,7 @@ fn nested_loop_join(
             combined.extend_from_slice(right);
 
             let matches = match quals {
-                Some(q) => matches!(eval_expr(q, &combined, ctx)?, Value::Bool(true)),
+                Some(q) => matches!(eval_expr(q, &combined, ctx, arena)?, ArenaValue::Bool(true)),
                 None => true, // CROSS JOIN
             };
 
@@ -2158,17 +2259,18 @@ fn nested_loop_join(
 /// Execute the full FROM clause, handling multiple comma-separated tables.
 fn execute_from_clause(
     from_clause: &[pg_query::protobuf::Node],
-) -> Result<(Vec<Vec<Value>>, JoinContext), String> {
+    arena: &mut QueryArena,
+) -> Result<(Vec<Vec<ArenaValue>>, JoinContext), String> {
     let first = from_clause
         .first()
         .and_then(|n| n.node.as_ref())
         .ok_or("missing FROM")?;
-    let (mut rows, mut ctx) = execute_from(first)?;
+    let (mut rows, mut ctx) = execute_from(first, arena)?;
 
     // Implicit cross join for FROM a, b, c ...
     for from_node in &from_clause[1..] {
         let node = from_node.node.as_ref().ok_or("missing FROM node")?;
-        let (right_rows, right_ctx) = execute_from(node)?;
+        let (right_rows, right_ctx) = execute_from(node, arena)?;
         let left_width = ctx.total_columns;
         let right_width = right_ctx.total_columns;
 
@@ -2298,10 +2400,11 @@ fn resolve_targets(
 /// Used by subqueries and as the base for exec_select.
 fn exec_select_raw(
     select: &pg_query::protobuf::SelectStmt,
-    outer: Option<(&[Value], &JoinContext)>,
-) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
+    outer: Option<(&[ArenaValue], &JoinContext)>,
+    arena: &mut QueryArena,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
     if select.from_clause.is_empty() {
-        return exec_select_raw_no_from(select, outer);
+        return exec_select_raw_no_from(select, outer, arena);
     }
 
     // Fast path: single-table query with no outer context — use scan_with
@@ -2345,7 +2448,8 @@ fn exec_select_raw(
                         .skip(offset)
                         .map(|(_, row_id)| *row_id)
                         .collect();
-                    let rows = storage::get_rows_by_ids(schema, &rv.relname, &row_ids)?;
+                    let value_rows = storage::get_rows_by_ids(schema, &rv.relname, &row_ids)?;
+                    let rows = rows_to_arena(&value_rows, arena);
 
                     // Project results (skip ORDER BY / LIMIT in post_filter since
                     // HNSW already returns sorted top-K)
@@ -2369,13 +2473,13 @@ fn exec_select_raw(
                             let val = match t {
                                 SelectTarget::Column { idx, .. } => {
                                     if *idx < row.len() {
-                                        row[*idx].clone()
+                                        row[*idx] // ArenaValue is Copy
                                     } else {
-                                        Value::Null
+                                        ArenaValue::Null
                                     }
                                 }
                                 SelectTarget::Expr { expr, .. } => {
-                                    eval_expr(expr, row, &ctx)?
+                                    eval_expr(expr, row, &ctx, arena)?
                                 }
                             };
                             result_row.push(val);
@@ -2389,35 +2493,35 @@ fn exec_select_raw(
 
             // Filter inside the read lock — clone only matching rows.
 
-            let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx);
-            let rows = storage::scan_with(schema, &rv.relname, |all_rows| {
+            let fast_filter = try_fast_equality_filter(&select.where_clause, &ctx, arena);
+            let value_rows = storage::scan_with(schema, &rv.relname, |all_rows| {
                 let mut filtered = Vec::new();
                 if let Some(ref ff) = fast_filter {
-                    // Fast path: direct column comparison — no eval_expr overhead.
-                    // Principle 4: vectorized WHERE for simple equality.
                     for row in all_rows {
-                        if ff.matches(row) {
+                        if ff.matches_value(row, arena) {
                             filtered.push(row.clone());
                         }
                     }
                 } else {
-                    // General path: full eval_where with AST walking.
+                    // Single arena shared across all rows (not per-row).
+                    let mut scan_arena = QueryArena::new();
                     for row in all_rows {
-                        if eval_where(&select.where_clause, row, &ctx)? {
+                        if eval_where_value(&select.where_clause, row, &ctx, &mut scan_arena)? {
                             filtered.push(row.clone());
                         }
                     }
                 }
                 Ok(filtered)
             })?;
+            let rows = rows_to_arena(&value_rows, arena);
 
-            let result = exec_select_raw_post_filter(select, ctx, rows, 0);
+            let result = exec_select_raw_post_filter(select, ctx, rows, 0, arena);
             return result;
         }
     }
 
     // General path: JOINs, implicit joins, subqueries, correlated
-    let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause)?;
+    let (all_rows, inner_ctx) = execute_from_clause(&select.from_clause, arena)?;
 
     // If we have an outer context (correlated subquery), merge it
     let (eval_rows, merged_ctx, outer_width) = if let Some((outer_row, outer_ctx)) = outer {
@@ -2447,7 +2551,7 @@ fn exec_select_raw(
             sources,
         };
         // Prepend outer row to each inner row
-        let rows: Vec<Vec<Value>> = all_rows
+        let rows: Vec<Vec<ArenaValue>> = all_rows
             .into_iter()
             .map(|inner_row| {
                 let mut combined = outer_row.to_vec();
@@ -2463,37 +2567,39 @@ fn exec_select_raw(
     // WHERE filter
     let mut rows = Vec::new();
     for row in eval_rows {
-        if eval_where(&select.where_clause, &row, &merged_ctx)? {
+        if eval_where(&select.where_clause, &row, &merged_ctx, arena)? {
             rows.push(row);
         }
     }
 
-    return exec_select_raw_post_filter(select, merged_ctx, rows, outer_width);
+    return exec_select_raw_post_filter(select, merged_ctx, rows, outer_width, arena);
 }
 
 /// Shared post-filter logic: aggregates, ORDER BY, LIMIT, projection.
 fn exec_select_raw_post_filter(
     select: &pg_query::protobuf::SelectStmt,
     merged_ctx: JoinContext,
-    mut rows: Vec<Vec<Value>>,
+    mut rows: Vec<Vec<ArenaValue>>,
     _outer_width: usize,
-) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
+    arena: &mut QueryArena,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
     // Route to aggregate path if needed
     if query_has_aggregates(select) || !select.group_clause.is_empty() {
-        let agg_result = exec_select_aggregate(select, &merged_ctx, rows)?;
+        let agg_result = exec_select_aggregate(select, &merged_ctx, rows, arena)?;
         // Convert string rows back to typed Value rows using column OIDs
         let col_oids: Vec<i32> = agg_result.columns.iter().map(|(_, oid)| *oid).collect();
-        let mut value_rows: Vec<Vec<Value>> = agg_result
+        let mut value_rows: Vec<Vec<ArenaValue>> = agg_result
             .rows
             .into_iter()
             .map(|row| {
                 row.into_iter()
                     .enumerate()
                     .map(|(i, cell)| match cell {
-                        None => Value::Null,
+                        None => ArenaValue::Null,
                         Some(s) => {
                             let oid = col_oids.get(i).copied().unwrap_or(25);
-                            parse_text_to_value(&s, oid)
+                            let v = parse_text_to_value(&s, oid);
+                            ArenaValue::from_value(&v, arena)
                         }
                     })
                     .collect()
@@ -2505,7 +2611,7 @@ fn exec_select_raw_post_filter(
             let sort_keys = resolve_aggregate_sort_keys(
                 &select.sort_clause, &agg_result.columns, &merged_ctx, select,
             )?;
-            value_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
+            value_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
         }
 
         // Apply OFFSET
@@ -2533,8 +2639,8 @@ fn exec_select_raw_post_filter(
     // ORDER BY (on full rows before projection)
     if !select.sort_clause.is_empty() {
         let (sort_keys, expr_count) =
-            resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows)?;
-        rows.sort_by(|a, b| compare_rows(&sort_keys, a, b));
+            resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows, arena)?;
+        rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
         // Strip temporary expression columns appended for sorting
         if expr_count > 0 {
             for row in rows.iter_mut() {
@@ -2582,7 +2688,7 @@ fn exec_select_raw_post_filter(
             let val = match t {
                 SelectTarget::Column { idx, .. } => {
                     if *idx < row.len() {
-                        row[*idx].clone()
+                        row[*idx] // ArenaValue is Copy
                     } else {
                         return Err(format!(
                             "internal error: column index {} out of range for row of width {}",
@@ -2591,7 +2697,7 @@ fn exec_select_raw_post_filter(
                     }
                 }
                 SelectTarget::Expr { expr, .. } => {
-                    eval_expr(expr, row, &merged_ctx)?
+                    eval_expr(expr, row, &merged_ctx, arena)?
                 }
             };
             result_row.push(val);
@@ -2607,9 +2713,10 @@ fn exec_select_raw_post_filter(
 /// Handle SELECT with no FROM clause, returning raw Values.
 fn exec_select_raw_no_from(
     select: &pg_query::protobuf::SelectStmt,
-    outer: Option<(&[Value], &JoinContext)>,
-) -> Result<(Vec<(String, i32)>, Vec<Vec<Value>>), String> {
-    let (eval_row, eval_ctx): (Vec<Value>, JoinContext) = if let Some((outer_row, outer_ctx)) = outer
+    outer: Option<(&[ArenaValue], &JoinContext)>,
+    arena: &mut QueryArena,
+) -> Result<(Vec<(String, i32)>, Vec<Vec<ArenaValue>>), String> {
+    let (eval_row, eval_ctx): (Vec<ArenaValue>, JoinContext) = if let Some((outer_row, outer_ctx)) = outer
     {
         let sources: Vec<JoinSource> = outer_ctx
             .sources
@@ -2650,8 +2757,8 @@ fn exec_select_raw_no_from(
                 rt.name.clone()
             };
             let val = match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
-                Some(expr) => eval_expr(expr, &eval_row, &eval_ctx)?,
-                None => Value::Null,
+                Some(expr) => eval_expr(expr, &eval_row, &eval_ctx, arena)?,
+                None => ArenaValue::Null,
             };
             columns.push((alias, TypeOid::Text.oid()));
             row.push(val);
@@ -2664,10 +2771,11 @@ fn exec_select_raw_no_from(
 fn exec_select(
     select: &pg_query::protobuf::SelectStmt,
 ) -> Result<QueryResult, String> {
-    let (columns, raw_rows) = exec_select_raw(select, None)?;
+    let mut arena = QueryArena::new();
+    let (columns, raw_rows) = exec_select_raw(select, None, &mut arena)?;
     let rows: Vec<Vec<Option<String>>> = raw_rows
         .iter()
-        .map(|row| row.iter().map(|v| v.to_text()).collect())
+        .map(|row| row.iter().map(|v| v.to_text(&arena)).collect())
         .collect();
     let count = rows.len();
     Ok(QueryResult {
@@ -2694,7 +2802,8 @@ fn resolve_sort_keys_with_exprs(
     sort_clause: &[pg_query::protobuf::Node],
     ctx: &JoinContext,
     select: &pg_query::protobuf::SelectStmt,
-    rows: &mut Vec<Vec<Value>>,
+    rows: &mut Vec<Vec<ArenaValue>>,
+    arena: &mut QueryArena,
 ) -> Result<(Vec<SortKey>, usize), String> {
     let mut keys = Vec::new();
     let mut expr_nodes: Vec<(usize, &NodeEnum)> = Vec::new(); // (key_index, expr_node)
@@ -2749,7 +2858,7 @@ fn resolve_sort_keys_with_exprs(
     if expr_count > 0 {
         for row in rows.iter_mut() {
             // Pre-extend with Nulls
-            row.resize(next_col, Value::Null);
+            row.resize(next_col, ArenaValue::Null);
         }
         // Need to clone expr_nodes data to avoid borrow issues
         let expr_data: Vec<(usize, NodeEnum)> = expr_nodes
@@ -2759,7 +2868,7 @@ fn resolve_sort_keys_with_exprs(
         for row in rows.iter_mut() {
             for (key_idx, expr_node) in &expr_data {
                 let col_idx = keys[*key_idx].col_idx;
-                let val = eval_expr(expr_node, row, ctx)?;
+                let val = eval_expr(expr_node, row, ctx, arena)?;
                 row[col_idx] = val;
             }
         }
@@ -2785,27 +2894,27 @@ fn resolve_ordinal_to_col_idx(
     Err("ORDER BY ordinal must reference a column".into())
 }
 
-fn compare_rows(keys: &[SortKey], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+fn compare_rows(keys: &[SortKey], a: &[ArenaValue], b: &[ArenaValue], arena: &QueryArena) -> std::cmp::Ordering {
     for k in keys {
-        let va = a.get(k.col_idx).unwrap_or(&Value::Null);
-        let vb = b.get(k.col_idx).unwrap_or(&Value::Null);
+        let va = a.get(k.col_idx).copied().unwrap_or(ArenaValue::Null);
+        let vb = b.get(k.col_idx).copied().unwrap_or(ArenaValue::Null);
         let ord = match (va, vb) {
-            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-            (Value::Null, _) => {
+            (ArenaValue::Null, ArenaValue::Null) => std::cmp::Ordering::Equal,
+            (ArenaValue::Null, _) => {
                 if k.nulls_first {
                     std::cmp::Ordering::Less
                 } else {
                     std::cmp::Ordering::Greater
                 }
             }
-            (_, Value::Null) => {
+            (_, ArenaValue::Null) => {
                 if k.nulls_first {
                     std::cmp::Ordering::Greater
                 } else {
                     std::cmp::Ordering::Less
                 }
             }
-            _ => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+            _ => va.compare(&vb, arena).unwrap_or(std::cmp::Ordering::Equal),
         };
         let ord = if k.ascending { ord } else { ord.reverse() };
         if ord != std::cmp::Ordering::Equal {
@@ -2907,25 +3016,47 @@ fn resolve_aggregate_sort_keys(
 fn exec_select_aggregate(
     select: &pg_query::protobuf::SelectStmt,
     ctx: &JoinContext,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<ArenaValue>>,
+    arena: &mut QueryArena,
 ) -> Result<QueryResult, String> {
     let group_col_indices = resolve_group_columns(&select.group_clause, ctx)?;
 
     // Group rows (use Vec to maintain insertion order, HashMap for O(1) lookup)
-    let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
-    let mut group_index: HashMap<Vec<Value>, usize> = HashMap::new();
+    let mut groups: Vec<(Vec<ArenaValue>, Vec<Vec<ArenaValue>>)> = Vec::new();
+    let mut group_index: HashMap<u64, Vec<usize>> = HashMap::new();
 
     if group_col_indices.is_empty() {
         groups.push((vec![], rows));
     } else {
         for row in rows {
-            let key: Vec<Value> = group_col_indices.iter().map(|&i| row[i].clone()).collect();
+            let key: Vec<ArenaValue> = group_col_indices.iter().map(|&i| row[i]).collect();
 
-            if let Some(&idx) = group_index.get(&key) {
+            // Hash the key
+            let mut hasher = DefaultHasher::new();
+            for v in &key {
+                v.hash_with(arena, &mut hasher);
+            }
+            let h = hasher.finish();
+
+            // Look up by hash, verify equality
+            let mut found_idx = None;
+            if let Some(candidates) = group_index.get(&h) {
+                for &ci in candidates {
+                    let existing_key = &groups[ci].0;
+                    if existing_key.len() == key.len()
+                        && existing_key.iter().zip(key.iter()).all(|(a, b)| a.eq_with(b, arena))
+                    {
+                        found_idx = Some(ci);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(idx) = found_idx {
                 groups[idx].1.push(row);
             } else {
                 let idx = groups.len();
-                group_index.insert(key.clone(), idx);
+                group_index.entry(h).or_default().push(idx);
                 groups.push((key, vec![row]));
             }
         }
@@ -2948,7 +3079,7 @@ fn exec_select_aggregate(
                         let name = extract_func_name(fc);
                         if is_aggregate(&name) {
                             let agg_val =
-                                compute_aggregate(&name, fc, group_rows, ctx)?;
+                                compute_aggregate(&name, fc, group_rows, ctx, arena)?;
                             if !columns_built {
                                 let alias = if rt.name.is_empty() {
                                     name.clone()
@@ -2962,7 +3093,7 @@ fn exec_select_aggregate(
                                 };
                                 result_columns.push((alias, oid));
                             }
-                            result_row.push(agg_val.to_text());
+                            result_row.push(agg_val.to_text(arena));
                         } else {
                             return Err(format!(
                                 "function {}() is not an aggregate function",
@@ -2995,7 +3126,7 @@ fn exec_select_aggregate(
                             .iter()
                             .position(|&i| i == col_idx)
                             .unwrap();
-                        result_row.push(group_key[key_pos].to_text());
+                        result_row.push(group_key[key_pos].to_text(arena));
                     }
                     _ => {
                         return Err(
@@ -3010,16 +3141,17 @@ fn exec_select_aggregate(
         columns_built = true;
     }
 
-    // HAVING filter
+    // HAVING filter — collect passing indices, then retain (no per-row clone).
     if let Some(having_node) = &select.having_clause {
         if let Some(having_expr) = having_node.node.as_ref() {
-            let mut filtered = Vec::new();
+            let mut keep = vec![false; result_rows.len()];
             for (i, (_, group_rows)) in groups.iter().enumerate() {
-                if eval_having(having_expr, group_rows, ctx)? {
-                    filtered.push(result_rows[i].clone());
+                if i < keep.len() && eval_having(having_expr, group_rows, ctx, arena)? {
+                    keep[i] = true;
                 }
             }
-            result_rows = filtered;
+            let mut idx = 0;
+            result_rows.retain(|_| { let k = keep[idx]; idx += 1; k });
         }
     }
 
@@ -3047,13 +3179,14 @@ fn resolve_group_columns(
 fn compute_aggregate(
     name: &str,
     fc: &pg_query::protobuf::FuncCall,
-    rows: &[Vec<Value>],
+    rows: &[Vec<ArenaValue>],
     ctx: &JoinContext,
-) -> Result<Value, String> {
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
     match name {
         "count" => {
             if fc.agg_star {
-                Ok(Value::Int(rows.len() as i64))
+                Ok(ArenaValue::Int(rows.len() as i64))
             } else {
                 let arg = fc
                     .args
@@ -3062,12 +3195,12 @@ fn compute_aggregate(
                     .ok_or("COUNT requires argument")?;
                 let mut count: i64 = 0;
                 for row in rows {
-                    match eval_expr(arg, row, ctx)? {
-                        Value::Null => {} // COUNT(col) skips NULLs
+                    match eval_expr(arg, row, ctx, arena)? {
+                        ArenaValue::Null => {} // COUNT(col) skips NULLs
                         _ => count += 1,
                     }
                 }
-                Ok(Value::Int(count))
+                Ok(ArenaValue::Int(count))
             }
         }
         "sum" => {
@@ -3081,27 +3214,27 @@ fn compute_aggregate(
             let mut is_float = false;
             let mut has_val = false;
             for row in rows {
-                match eval_expr(arg, row, ctx)? {
-                    Value::Int(n) => {
+                match eval_expr(arg, row, ctx, arena)? {
+                    ArenaValue::Int(n) => {
                         si = si.checked_add(n).ok_or("integer out of range")?;
                         has_val = true;
                     }
-                    Value::Float(f) => {
+                    ArenaValue::Float(f) => {
                         sf += f;
                         is_float = true;
                         has_val = true;
                     }
-                    Value::Null => {}
+                    ArenaValue::Null => {}
                     _ => return Err("SUM requires numeric".into()),
                 }
             }
             if !has_val {
-                return Ok(Value::Null);
+                return Ok(ArenaValue::Null);
             }
             Ok(if is_float {
-                Value::Float(sf + si as f64)
+                ArenaValue::Float(sf + si as f64)
             } else {
-                Value::Int(si)
+                ArenaValue::Int(si)
             })
         }
         "avg" => {
@@ -3113,23 +3246,23 @@ fn compute_aggregate(
             let mut sum: f64 = 0.0;
             let mut count: i64 = 0;
             for row in rows {
-                match eval_expr(arg, row, ctx)? {
-                    Value::Int(n) => {
+                match eval_expr(arg, row, ctx, arena)? {
+                    ArenaValue::Int(n) => {
                         sum += n as f64;
                         count += 1;
                     }
-                    Value::Float(f) => {
+                    ArenaValue::Float(f) => {
                         sum += f;
                         count += 1;
                     }
-                    Value::Null => {}
+                    ArenaValue::Null => {}
                     _ => return Err("AVG requires numeric".into()),
                 }
             }
             Ok(if count == 0 {
-                Value::Null
+                ArenaValue::Null
             } else {
-                Value::Float(sum / count as f64)
+                ArenaValue::Float(sum / count as f64)
             })
         }
         "min" => {
@@ -3138,16 +3271,16 @@ fn compute_aggregate(
                 .first()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("MIN requires argument")?;
-            let mut result: Option<Value> = None;
+            let mut result: Option<ArenaValue> = None;
             for row in rows {
-                let v = eval_expr(arg, row, ctx)?;
-                if matches!(v, Value::Null) {
+                let v = eval_expr(arg, row, ctx, arena)?;
+                if v.is_null() {
                     continue;
                 }
                 result = Some(match result {
                     None => v,
                     Some(cur) => {
-                        if v.compare(&cur) == Some(std::cmp::Ordering::Less) {
+                        if v.compare(&cur, arena) == Some(std::cmp::Ordering::Less) {
                             v
                         } else {
                             cur
@@ -3155,7 +3288,7 @@ fn compute_aggregate(
                     }
                 });
             }
-            Ok(result.unwrap_or(Value::Null))
+            Ok(result.unwrap_or(ArenaValue::Null))
         }
         "max" => {
             let arg = fc
@@ -3163,16 +3296,16 @@ fn compute_aggregate(
                 .first()
                 .and_then(|a| a.node.as_ref())
                 .ok_or("MAX requires argument")?;
-            let mut result: Option<Value> = None;
+            let mut result: Option<ArenaValue> = None;
             for row in rows {
-                let v = eval_expr(arg, row, ctx)?;
-                if matches!(v, Value::Null) {
+                let v = eval_expr(arg, row, ctx, arena)?;
+                if v.is_null() {
                     continue;
                 }
                 result = Some(match result {
                     None => v,
                     Some(cur) => {
-                        if v.compare(&cur) == Some(std::cmp::Ordering::Greater) {
+                        if v.compare(&cur, arena) == Some(std::cmp::Ordering::Greater) {
                             v
                         } else {
                             cur
@@ -3180,7 +3313,7 @@ fn compute_aggregate(
                     }
                 });
             }
-            Ok(result.unwrap_or(Value::Null))
+            Ok(result.unwrap_or(ArenaValue::Null))
         }
         _ => Err(format!("unknown aggregate function: {}", name)),
     }
@@ -3188,23 +3321,25 @@ fn compute_aggregate(
 
 fn eval_having(
     expr: &NodeEnum,
-    group_rows: &[Vec<Value>],
+    group_rows: &[Vec<ArenaValue>],
     ctx: &JoinContext,
+    arena: &mut QueryArena,
 ) -> Result<bool, String> {
-    let val = eval_having_expr(expr, group_rows, ctx)?;
-    Ok(matches!(val, Value::Bool(true)))
+    let val = eval_having_expr(expr, group_rows, ctx, arena)?;
+    Ok(matches!(val, ArenaValue::Bool(true)))
 }
 
 fn eval_having_expr(
     node: &NodeEnum,
-    group_rows: &[Vec<Value>],
+    group_rows: &[Vec<ArenaValue>],
     ctx: &JoinContext,
-) -> Result<Value, String> {
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
     match node {
         NodeEnum::FuncCall(fc) => {
             let name = extract_func_name(fc);
             if is_aggregate(&name) {
-                compute_aggregate(&name, fc, group_rows, ctx)
+                compute_aggregate(&name, fc, group_rows, ctx, arena)
             } else {
                 Err(format!("non-aggregate function in HAVING: {}", name))
             }
@@ -3215,25 +3350,25 @@ fn eval_having_expr(
                 .lexpr
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
-                .map(|n| eval_having_expr(n, group_rows, ctx))
+                .map(|n| eval_having_expr(n, group_rows, ctx, arena))
                 .transpose()?;
             let right = expr
                 .rexpr
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
-                .map(|n| eval_having_expr(n, group_rows, ctx))
+                .map(|n| eval_having_expr(n, group_rows, ctx, arena))
                 .transpose()?;
 
             let (l, r) = match (left, right) {
                 (Some(l), Some(r)) => (l, r),
-                _ => return Ok(Value::Null),
+                _ => return Ok(ArenaValue::Null),
             };
 
-            if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                return Ok(Value::Null);
+            if l.is_null() || r.is_null() {
+                return Ok(ArenaValue::Null);
             }
 
-            let cmp = l.compare(&r);
+            let cmp = l.compare(&r, arena);
             let result = match op.as_str() {
                 "=" => cmp.map(|o| o == std::cmp::Ordering::Equal),
                 "<>" | "!=" => cmp.map(|o| o != std::cmp::Ordering::Equal),
@@ -3243,38 +3378,38 @@ fn eval_having_expr(
                 ">=" => cmp.map(|o| o != std::cmp::Ordering::Less),
                 _ => return Err(format!("unsupported operator in HAVING: {}", op)),
             };
-            Ok(result.map(Value::Bool).unwrap_or(Value::Null))
+            Ok(result.map(ArenaValue::Bool).unwrap_or(ArenaValue::Null))
         }
         NodeEnum::AConst(_) | NodeEnum::Integer(_) | NodeEnum::Float(_) => {
             let dummy_ctx = JoinContext {
                 sources: vec![],
                 total_columns: 0,
             };
-            eval_expr(node, &[], &dummy_ctx)
+            eval_expr(node, &[], &dummy_ctx, arena)
         }
         NodeEnum::BoolExpr(be) => {
             let boolop = be.boolop;
             if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
-                        match eval_having_expr(n, group_rows, ctx)? {
-                            Value::Bool(false) => return Ok(Value::Bool(false)),
-                            Value::Bool(true) => continue,
-                            _ => return Ok(Value::Null),
+                        match eval_having_expr(n, group_rows, ctx, arena)? {
+                            ArenaValue::Bool(false) => return Ok(ArenaValue::Bool(false)),
+                            ArenaValue::Bool(true) => continue,
+                            _ => return Ok(ArenaValue::Null),
                         }
                     }
                 }
-                Ok(Value::Bool(true))
+                Ok(ArenaValue::Bool(true))
             } else if boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
-                        match eval_having_expr(n, group_rows, ctx)? {
-                            Value::Bool(true) => return Ok(Value::Bool(true)),
+                        match eval_having_expr(n, group_rows, ctx, arena)? {
+                            ArenaValue::Bool(true) => return Ok(ArenaValue::Bool(true)),
                             _ => continue,
                         }
                     }
                 }
-                Ok(Value::Bool(false))
+                Ok(ArenaValue::Bool(false))
             } else {
                 Err("unsupported HAVING boolean expression".into())
             }
@@ -3305,25 +3440,27 @@ fn exec_delete(
 
     let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
-        // This catches expression errors (bad column refs, type mismatches) before mutation.
+        // Validate WHERE clause — single arena shared across all rows.
+        let mut validate_arena = QueryArena::new();
         storage::scan_with(schema, table_name, |all_rows| {
             for row in all_rows {
-                eval_where(&delete.where_clause, row, &ctx)?;
+                eval_where_value(&delete.where_clause, row, &ctx, &mut validate_arena)?;
             }
             Ok(())
         })?;
         if has_returning {
             let wc = delete.where_clause.clone();
+            let mut del_arena = QueryArena::new();
             let rows = storage::delete_where_returning(schema, table_name, |row| {
-                eval_where(&wc, row, &ctx).unwrap_or(false)
+                eval_where_value(&wc, row, &ctx, &mut del_arena).unwrap_or(false)
             })?;
             let n = rows.len() as u64;
             (n, rows)
         } else {
             let wc = delete.where_clause.clone();
+            let mut del_arena = QueryArena::new();
             let n = storage::delete_where(schema, table_name, |row| {
-                eval_where(&wc, row, &ctx).unwrap_or(false)
+                eval_where_value(&wc, row, &ctx, &mut del_arena).unwrap_or(false)
             })?;
             (n, vec![])
         }
@@ -3384,11 +3521,11 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause inside read lock via scan_with — avoids cloning all rows.
-    // This catches expression errors (bad column refs, type mismatches) before mutation.
+    // Validate WHERE clause — single arena shared across all rows.
+    let mut validate_arena = QueryArena::new();
     storage::scan_with(schema, table_name, |all_rows| {
         for row in all_rows {
-            eval_where(&update.where_clause, row, &ctx)?;
+            eval_where_value(&update.where_clause, row, &ctx, &mut validate_arena)?;
         }
         Ok(())
     })?;
@@ -3400,16 +3537,18 @@ fn exec_update(
 
     let has_returning = !update.returning_list.is_empty();
     let mut updated_rows: Vec<Vec<Value>> = Vec::new();
+    let mut pred_arena = QueryArena::new();
+    let mut expr_arena = QueryArena::new();
 
     let count = storage::update_rows_checked(
         schema,
         table_name,
-        |row| eval_where(&wc, row, &ctx2).unwrap_or(false),
+        |row| eval_where_value(&wc, row, &ctx2, &mut pred_arena).unwrap_or(false),
         |row| {
             let ctx_inner = JoinContext::single(schema, table_name, td.clone());
             let mut new_row = row.clone();
             for (col_idx, expr_node) in &assigns {
-                new_row[*col_idx] = eval_expr(expr_node, row, &ctx_inner)?;
+                new_row[*col_idx] = eval_expr_value(expr_node, row, &ctx_inner, &mut expr_arena)?;
             }
             check_not_null(&td, &new_row)?;
             if has_returning {

@@ -1,3 +1,4 @@
+mod arena;
 mod catalog;
 mod executor;
 mod hnsw;
