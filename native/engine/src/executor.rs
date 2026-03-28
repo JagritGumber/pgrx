@@ -302,23 +302,28 @@ fn exec_create_table(
                         x if x == pg_query::protobuf::ConstrType::ConstrDefault as i32 => {
                             // Parse DEFAULT expression
                             if let Some(raw) = c.raw_expr.as_ref().and_then(|n| n.node.as_ref()) {
-                                match raw {
-                                    NodeEnum::FuncCall(fc) => {
-                                        let func_name: String = fc.funcname.iter()
-                                            .filter_map(|n| n.node.as_ref())
-                                            .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
-                                            .collect::<Vec<_>>().join(".");
-                                        return Err(format!(
-                                            "DEFAULT function expressions are not yet supported: {}",
-                                            func_name
-                                        ));
+                                let func_node = match raw {
+                                    NodeEnum::FuncCall(_) => Some(raw),
+                                    NodeEnum::TypeCast(tc) => {
+                                        tc.arg.as_ref()
+                                            .and_then(|a| a.node.as_ref())
+                                            .filter(|n| matches!(n, NodeEnum::FuncCall(_)))
                                     }
-                                    _ => {
-                                        default_expr = Some(catalog::DefaultExpr::Literal(
-                                            eval_const(Some(raw)),
-                                        ));
-                                    }
+                                    _ => None,
+                                };
+                                if let Some(NodeEnum::FuncCall(fc)) = func_node {
+                                    let func_name: String = fc.funcname.iter()
+                                        .filter_map(|n| n.node.as_ref())
+                                        .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                                        .collect::<Vec<_>>().join(".");
+                                    return Err(format!(
+                                        "DEFAULT function expressions are not yet supported: {}",
+                                        func_name
+                                    ));
                                 }
+                                default_expr = Some(catalog::DefaultExpr::Literal(
+                                    eval_const(Some(raw)),
+                                ));
                             }
                         }
                         _ => {}
@@ -703,7 +708,7 @@ fn exec_insert(
         if storage::has_hnsw_index(schema, table_name).is_some() {
             for (i, row) in inserted_rows.iter().enumerate() {
                 if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
-                    let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
+                    storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone())?;
                 }
             }
         }
