@@ -138,7 +138,7 @@ impl Value {
             Value::Bytea(b) => Some(format!("\\x{}", hex_encode(b))),
             Value::Vector(v) => {
                 let inner: Vec<String> = v.iter().map(|f| {
-                    if *f == f.trunc() && f.is_finite() && *f > -2_147_483_649.0 && *f < 2_147_483_648.0 {
+                    if *f == f.trunc() && f.is_finite() && *f >= -2_147_483_648.0 && *f < 2_147_483_648.0 {
                         let i = *f as i32;
                         if i as f32 == *f {
                             format!("{}", i)

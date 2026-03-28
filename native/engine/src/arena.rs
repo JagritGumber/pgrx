@@ -166,7 +166,7 @@ impl ArenaValue {
             ArenaValue::Vector(v) => {
                 let data = arena.get_vec(*v);
                 let inner: Vec<String> = data.iter().map(|f| {
-                    if *f == f.trunc() && f.is_finite() && *f > -2_147_483_649.0 && *f < 2_147_483_648.0 {
+                    if *f == f.trunc() && f.is_finite() && *f >= -2_147_483_648.0 && *f < 2_147_483_648.0 {
                         let i = *f as i32;
                         if i as f32 == *f {
                             format!("{}", i)
