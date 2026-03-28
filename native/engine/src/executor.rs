@@ -261,8 +261,12 @@ fn exec_create_table(
     };
 
     let mut columns = Vec::new();
+    let mut created_sequences: Vec<(String, String)> = Vec::new();
     for elt in &create.table_elts {
-        let node = elt.node.as_ref().ok_or("missing table element")?;
+        let node = elt.node.as_ref().ok_or_else(|| {
+            for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+            "missing table element".to_string()
+        })?;
         if let NodeEnum::ColumnDef(col) = node {
             let type_name = extract_type_name(col);
             let mut nullable = !col.is_not_null;
@@ -277,7 +281,11 @@ fn exec_create_table(
             );
             if is_serial {
                 let seq_name = format!("{}_{}_seq", table_name, col.colname);
-                crate::sequence::create_sequence(schema, &seq_name, 1, 1)?;
+                crate::sequence::create_sequence(schema, &seq_name, 1, 1).map_err(|e| {
+                    for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+                    e
+                })?;
+                created_sequences.push((schema.to_string(), seq_name.clone()));
                 default_expr = Some(catalog::DefaultExpr::NextVal(
                     format!("{}.{}", schema, seq_name),
                 ));
@@ -316,6 +324,7 @@ fn exec_create_table(
                                         .filter_map(|n| n.node.as_ref())
                                         .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
                                         .collect::<Vec<_>>().join(".");
+                                    for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
                                     return Err(format!(
                                         "DEFAULT function expressions are not yet supported: {}",
                                         func_name
