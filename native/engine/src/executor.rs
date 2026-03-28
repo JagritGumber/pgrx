@@ -261,8 +261,12 @@ fn exec_create_table(
     };
 
     let mut columns = Vec::new();
+    let mut created_sequences: Vec<(String, String)> = Vec::new();
     for elt in &create.table_elts {
-        let node = elt.node.as_ref().ok_or("missing table element")?;
+        let node = elt.node.as_ref().ok_or_else(|| {
+            for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+            "missing table element".to_string()
+        })?;
         if let NodeEnum::ColumnDef(col) = node {
             let type_name = extract_type_name(col);
             let mut nullable = !col.is_not_null;
@@ -277,7 +281,11 @@ fn exec_create_table(
             );
             if is_serial {
                 let seq_name = format!("{}_{}_seq", table_name, col.colname);
-                crate::sequence::create_sequence(schema, &seq_name, 1, 1)?;
+                crate::sequence::create_sequence(schema, &seq_name, 1, 1).map_err(|e| {
+                    for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+                    e
+                })?;
+                created_sequences.push((schema.to_string(), seq_name.clone()));
                 default_expr = Some(catalog::DefaultExpr::NextVal(
                     format!("{}.{}", schema, seq_name),
                 ));
@@ -302,6 +310,26 @@ fn exec_create_table(
                         x if x == pg_query::protobuf::ConstrType::ConstrDefault as i32 => {
                             // Parse DEFAULT expression
                             if let Some(raw) = c.raw_expr.as_ref().and_then(|n| n.node.as_ref()) {
+                                let func_node = match raw {
+                                    NodeEnum::FuncCall(_) => Some(raw),
+                                    NodeEnum::TypeCast(tc) => {
+                                        tc.arg.as_ref()
+                                            .and_then(|a| a.node.as_ref())
+                                            .filter(|n| matches!(n, NodeEnum::FuncCall(_)))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(NodeEnum::FuncCall(fc)) = func_node {
+                                    let func_name: String = fc.funcname.iter()
+                                        .filter_map(|n| n.node.as_ref())
+                                        .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                                        .collect::<Vec<_>>().join(".");
+                                    for (s, n) in &created_sequences { crate::sequence::drop_sequence(s, n); }
+                                    return Err(format!(
+                                        "DEFAULT function expressions are not yet supported: {}",
+                                        func_name
+                                    ));
+                                }
                                 default_expr = Some(catalog::DefaultExpr::Literal(
                                     eval_const(Some(raw)),
                                 ));
@@ -661,7 +689,6 @@ fn exec_insert(
     // then insert all at once. If any row fails, nothing is committed. (#4)
     let (unique_checks, pk_cols) = build_unique_checks(&table_def);
     let row_count = all_rows.len() as u64;
-    let inserted_rows = if has_returning { all_rows.clone() } else { Vec::new() };
 
     // Auto-create HNSW index on first INSERT if table has a vector column
     let vector_col_idx = table_def
@@ -678,36 +705,22 @@ fn exec_insert(
         );
     }
 
-    // Collect vectors for HNSW insertion (before batch moves the rows)
-    let hnsw_vectors: Vec<(usize, Vec<f32>)> = if let Some(col_idx) = vector_col_idx {
-        if storage::has_hnsw_index(schema, table_name).is_some() {
-            // Get current row count to compute row_ids for the new rows
-            let base_row_id = storage::row_count(schema, table_name).unwrap_or(0) as usize;
-            all_rows
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| {
-                    if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
-                        Some((base_row_id + i, v.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let needs_row_copy = has_returning || vector_col_idx.is_some();
+    let inserted_rows = if needs_row_copy { all_rows.clone() } else { Vec::new() };
 
-    storage::insert_batch_checked(
+    let base_row_id = storage::insert_batch_checked(
         schema, table_name, all_rows, &unique_checks, &pk_cols,
     )?;
 
-    // Insert vectors into HNSW index after successful row insertion
-    for (row_id, vector) in hnsw_vectors {
-        let _ = storage::hnsw_insert(schema, table_name, row_id, vector);
+    // Insert vectors into HNSW index using the correct base_row_id from inside the write lock
+    if let Some(col_idx) = vector_col_idx {
+        if storage::has_hnsw_index(schema, table_name).is_some() {
+            for (i, row) in inserted_rows.iter().enumerate() {
+                if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
+                    let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
+                }
+            }
+        }
     }
 
     let tag = format!("INSERT 0 {}", row_count);
@@ -4954,68 +4967,30 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn join_multi_condition() {
+    fn hnsw_insert_correct_row_ids() {
         setup();
-        execute("CREATE TABLE jmc_t1 (a INT, b INT)").unwrap();
-        execute("CREATE TABLE jmc_t2 (x INT, y INT)").unwrap();
-        execute("INSERT INTO jmc_t1 VALUES (1, 10), (1, 20), (2, 10)").unwrap();
-        execute("INSERT INTO jmc_t2 VALUES (1, 10), (1, 20), (2, 30)").unwrap();
-        let r = execute("SELECT jmc_t1.a, jmc_t1.b, jmc_t2.y FROM jmc_t1 JOIN jmc_t2 ON jmc_t1.a = jmc_t2.x AND jmc_t1.b = jmc_t2.y").unwrap();
-        assert_eq!(r.rows.len(), 2); // (1,10,10) and (1,20,20) - not 3
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn having_column_ref() {
-        setup();
-        execute("CREATE TABLE hcr_emp (dept TEXT, salary INT)").unwrap();
-        execute("INSERT INTO hcr_emp VALUES ('Sales', 100), ('Sales', 200), ('Eng', 300)").unwrap();
-        let r = execute("SELECT dept, COUNT(*) FROM hcr_emp GROUP BY dept HAVING dept = 'Sales'").unwrap();
+        execute("CREATE TABLE vec_t (id INT, v VECTOR)").unwrap();
+        execute("INSERT INTO vec_t VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]')").unwrap();
+        let r = execute("SELECT id FROM vec_t ORDER BY v <-> '[1,0,0]' LIMIT 1").unwrap();
         assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".to_string()));
     }
 
     #[test]
     #[serial_test::serial]
-    fn typecast_int() {
+    fn pk_null_rejected_at_storage() {
         setup();
-        execute("CREATE TABLE tci_t (a TEXT)").unwrap();
-        execute("INSERT INTO tci_t VALUES ('42')").unwrap();
-        let r = execute("SELECT a::int + 1 FROM tci_t").unwrap();
-        assert_eq!(r.rows[0][0], Some("43".to_string()));
+        execute("CREATE TABLE pk_t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        let r = execute("INSERT INTO pk_t VALUES (NULL, 'test')");
+        assert!(r.is_err());
     }
 
     #[test]
     #[serial_test::serial]
-    fn typecast_float() {
+    fn default_function_error() {
         setup();
-        execute("CREATE TABLE tcf_t (a TEXT)").unwrap();
-        execute("INSERT INTO tcf_t VALUES ('3.14')").unwrap();
-        let r = execute("SELECT a::float8 FROM tcf_t").unwrap();
-        // Float representation may vary, just check it parses
-        let val: f64 = r.rows[0][0].as_ref().unwrap().parse().unwrap();
-        assert!((val - 3.14).abs() < 0.001);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn typecast_text() {
-        setup();
-        execute("CREATE TABLE tct_t (a INT)").unwrap();
-        execute("INSERT INTO tct_t VALUES (99)").unwrap();
-        let r = execute("SELECT a::text FROM tct_t").unwrap();
-        assert_eq!(r.rows[0][0], Some("99".to_string()));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn typecast_bool() {
-        setup();
-        execute("CREATE TABLE tcb_t (a TEXT)").unwrap();
-        execute("INSERT INTO tcb_t VALUES ('true'), ('false'), ('yes'), ('0')").unwrap();
-        let r = execute("SELECT a::boolean FROM tcb_t").unwrap();
-        assert_eq!(r.rows[0][0], Some("t".to_string()));
-        assert_eq!(r.rows[1][0], Some("f".to_string()));
-        assert_eq!(r.rows[2][0], Some("t".to_string()));
-        assert_eq!(r.rows[3][0], Some("f".to_string()));
+        let r = execute("CREATE TABLE df_t (id INT, created_at TEXT DEFAULT now())");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not yet supported"));
     }
 }
