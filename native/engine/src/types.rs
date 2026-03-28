@@ -133,13 +133,18 @@ impl Value {
             Value::Null => None,
             Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
             Value::Int(i) => Some(i.to_string()),
-            Value::Float(f) => Some(f.to_string()),
+            Value::Float(f) => Some(format_float(*f)),
             Value::Text(s) => Some(s.to_string()),
             Value::Bytea(b) => Some(format!("\\x{}", hex_encode(b))),
             Value::Vector(v) => {
                 let inner: Vec<String> = v.iter().map(|f| {
-                    if *f == f.trunc() && f.is_finite() && f.abs() < (i32::MAX as f32) {
-                        format!("{}", *f as i32)
+                    if *f == f.trunc() && f.is_finite() && *f >= -2_147_483_648.0 && *f < 2_147_483_648.0 {
+                        let i = *f as i32;
+                        if i as f32 == *f {
+                            format!("{}", i)
+                        } else {
+                            format!("{}", f)
+                        }
                     } else {
                         format!("{}", f)
                     }
@@ -147,6 +152,18 @@ impl Value {
                 Some(format!("[{}]", inner.join(",")))
             }
         }
+    }
+}
+
+pub fn format_float(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f == f64::INFINITY {
+        "Infinity".to_string()
+    } else if f == f64::NEG_INFINITY {
+        "-Infinity".to_string()
+    } else {
+        f.to_string()
     }
 }
 
@@ -207,5 +224,17 @@ impl TypeOid {
             16385 => TypeOid::Vector,
             _ => TypeOid::Text,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_infinity_wire_format() {
+        assert_eq!(Value::Float(f64::INFINITY).to_text(), Some("Infinity".to_string()));
+        assert_eq!(Value::Float(f64::NEG_INFINITY).to_text(), Some("-Infinity".to_string()));
+        assert_eq!(Value::Float(f64::NAN).to_text(), Some("NaN".to_string()));
     }
 }

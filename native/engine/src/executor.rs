@@ -976,7 +976,6 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                 .and_then(|a| a.node.as_ref())
                 .ok_or("TypeCast missing arg")?;
             let val = eval_expr(inner, row, ctx, arena)?;
-            // Handle cast to vector type
             if let Some(tn) = &tc.type_name {
                 let type_name: String = tn
                     .names
@@ -991,17 +990,71 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                     })
                     .last()
                     .unwrap_or_default();
-                if type_name == "vector" {
-                    if let ArenaValue::Text(s) = &val {
-                        let text = arena.get_str(*s).to_string();
-                        let trimmed = text.trim();
-                        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                            let v = parse_vector_literal(trimmed)?;
-                            if let Value::Vector(data) = v {
-                                return Ok(ArenaValue::Vector(arena.alloc_vec(&data)));
+                match type_name.as_str() {
+                    "vector" => {
+                        if let ArenaValue::Text(s) = &val {
+                            let text = arena.get_str(*s).to_string();
+                            let trimmed = text.trim();
+                            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                                let v = parse_vector_literal(trimmed)?;
+                                if let Value::Vector(data) = v {
+                                    return Ok(ArenaValue::Vector(arena.alloc_vec(&data)));
+                                }
                             }
                         }
                     }
+                    "int4" | "int" | "integer" | "int8" | "bigint" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s);
+                                let i = text.trim().parse::<i64>().map_err(|_| format!("invalid input syntax for integer: \"{}\"", text))?;
+                                return Ok(ArenaValue::Int(i));
+                            }
+                            ArenaValue::Float(f) => return Ok(ArenaValue::Int(f.round() as i64)),
+                            ArenaValue::Int(_) => return Ok(val),
+                            ArenaValue::Bool(b) => return Ok(ArenaValue::Int(if *b { 1 } else { 0 })),
+                            _ => {}
+                        }
+                    }
+                    "float4" | "float8" | "real" | "double precision" | "numeric" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s);
+                                let f = text.trim().parse::<f64>().map_err(|_| format!("invalid input syntax for type double precision: \"{}\"", text))?;
+                                return Ok(ArenaValue::Float(f));
+                            }
+                            ArenaValue::Int(i) => return Ok(ArenaValue::Float(*i as f64)),
+                            ArenaValue::Float(_) => return Ok(val),
+                            _ => {}
+                        }
+                    }
+                    "text" | "varchar" | "char" | "character varying" => {
+                        let text = match &val {
+                            ArenaValue::Int(i) => i.to_string(),
+                            ArenaValue::Float(f) => f.to_string(),
+                            ArenaValue::Bool(b) => (if *b { "true" } else { "false" }).to_string(),
+                            ArenaValue::Text(_) => return Ok(val),
+                            _ => return Ok(val),
+                        };
+                        return Ok(ArenaValue::Text(arena.alloc_str(&text)));
+                    }
+                    "bool" | "boolean" => {
+                        match &val {
+                            ArenaValue::Text(s) => {
+                                let text = arena.get_str(*s).trim().to_lowercase();
+                                let b = match text.as_str() {
+                                    "t" | "true" | "yes" | "on" | "1" => true,
+                                    "f" | "false" | "no" | "off" | "0" => false,
+                                    _ => return Err(format!("invalid input syntax for type boolean: \"{}\"", text)),
+                                };
+                                return Ok(ArenaValue::Bool(b));
+                            }
+                            ArenaValue::Int(i) => return Ok(ArenaValue::Bool(*i != 0)),
+                            ArenaValue::Bool(_) => return Ok(val),
+                            _ => {}
+                        }
+                    }
+                    _ => {} // unknown cast type — pass through
                 }
             }
             Ok(val)
@@ -2062,14 +2115,9 @@ fn extract_equi_cols(quals: &NodeEnum, ctx: &JoinContext) -> Option<(usize, usiz
                 None
             }
         }
-        // AND: take the first equality condition
+        // AND: compound conditions — fall back to nested loop for correctness
         NodeEnum::BoolExpr(be) if be.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
-            for arg in &be.args {
-                if let Some(result) = arg.node.as_ref().and_then(|n| extract_equi_cols(n, ctx)) {
-                    return Some(result);
-                }
-            }
-            None
+            None  // Multiple conditions require full evaluation; use nested loop
         }
         _ => None,
     }
@@ -2107,8 +2155,8 @@ fn execute_hash_join(
     } else if right_key_col < left_width && left_key_col >= left_width {
         (right_key_col, left_key_col) // swap
     } else {
-        // Both on same side — can't hash join this, fall back
-        return nested_loop_join(left_rows, right_rows, join_type, None, ctx, left_width, right_width, arena);
+        // Both on same side — can't hash join, return error
+        return Err("JOIN ON condition references columns from the same table on both sides".into());
     };
     let right_local_key = right_key_col - left_width;
 
@@ -3403,29 +3451,38 @@ fn eval_having_expr(
         NodeEnum::BoolExpr(be) => {
             let boolop = be.boolop;
             if boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 {
+                let mut has_null = false;
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
                         match eval_having_expr(n, group_rows, ctx, arena)? {
                             ArenaValue::Bool(false) => return Ok(ArenaValue::Bool(false)),
                             ArenaValue::Bool(true) => continue,
-                            _ => return Ok(ArenaValue::Null),
+                            _ => { has_null = true; continue; }
                         }
                     }
                 }
-                Ok(ArenaValue::Bool(true))
+                Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(true) })
             } else if boolop == pg_query::protobuf::BoolExprType::OrExpr as i32 {
+                let mut has_null = false;
                 for arg in &be.args {
                     if let Some(n) = arg.node.as_ref() {
                         match eval_having_expr(n, group_rows, ctx, arena)? {
                             ArenaValue::Bool(true) => return Ok(ArenaValue::Bool(true)),
-                            _ => continue,
+                            ArenaValue::Bool(false) => continue,
+                            _ => { has_null = true; continue; }
                         }
                     }
                 }
-                Ok(ArenaValue::Bool(false))
+                Ok(if has_null { ArenaValue::Null } else { ArenaValue::Bool(false) })
             } else {
                 Err("unsupported HAVING boolean expression".into())
             }
+        }
+        NodeEnum::ColumnRef(_) => {
+            if group_rows.is_empty() {
+                return Ok(ArenaValue::Null);
+            }
+            eval_expr(node, &group_rows[0], ctx, arena)
         }
         _ => Err("unsupported expression in HAVING clause".into()),
     }
@@ -4914,7 +4971,6 @@ mod tests {
         setup();
         execute("CREATE TABLE vec_t (id INT, v VECTOR)").unwrap();
         execute("INSERT INTO vec_t VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]')").unwrap();
-        // KNN should find the correct nearest neighbor
         let r = execute("SELECT id FROM vec_t ORDER BY v <-> '[1,0,0]' LIMIT 1").unwrap();
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0][0], Some("1".to_string()));
@@ -4925,7 +4981,6 @@ mod tests {
     fn pk_null_rejected_at_storage() {
         setup();
         execute("CREATE TABLE pk_t (id INT PRIMARY KEY, name TEXT)").unwrap();
-        // This should fail - NULL in a PK column must be rejected
         let r = execute("INSERT INTO pk_t VALUES (NULL, 'test')");
         assert!(r.is_err());
     }

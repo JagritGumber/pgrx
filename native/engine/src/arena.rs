@@ -150,7 +150,7 @@ impl ArenaValue {
             ArenaValue::Null => None,
             ArenaValue::Bool(b) => Some(if *b { "t" } else { "f" }.into()),
             ArenaValue::Int(i) => Some(i.to_string()),
-            ArenaValue::Float(f) => Some(f.to_string()),
+            ArenaValue::Float(f) => Some(crate::types::format_float(*f)),
             ArenaValue::Text(s) => Some(arena.get_str(*s).to_string()),
             ArenaValue::Bytea(s) => {
                 let start = s.offset as usize;
@@ -166,8 +166,13 @@ impl ArenaValue {
             ArenaValue::Vector(v) => {
                 let data = arena.get_vec(*v);
                 let inner: Vec<String> = data.iter().map(|f| {
-                    if *f == f.trunc() && f.is_finite() && f.abs() < (i32::MAX as f32) {
-                        format!("{}", *f as i32)
+                    if *f == f.trunc() && f.is_finite() && *f >= -2_147_483_648.0 && *f < 2_147_483_648.0 {
+                        let i = *f as i32;
+                        if i as f32 == *f {
+                            format!("{}", i)
+                        } else {
+                            format!("{}", f)
+                        }
                     } else {
                         format!("{}", f)
                     }
@@ -434,5 +439,16 @@ mod tests {
     #[test]
     fn arena_value_size() {
         assert_eq!(std::mem::size_of::<ArenaValue>(), 16);
+    }
+
+    #[test]
+    fn arena_float_infinity_wire_format() {
+        let arena = QueryArena::new();
+        let inf = ArenaValue::Float(f64::INFINITY);
+        assert_eq!(inf.to_text(&arena), Some("Infinity".to_string()));
+        let neg_inf = ArenaValue::Float(f64::NEG_INFINITY);
+        assert_eq!(neg_inf.to_text(&arena), Some("-Infinity".to_string()));
+        let nan = ArenaValue::Float(f64::NAN);
+        assert_eq!(nan.to_text(&arena), Some("NaN".to_string()));
     }
 }
