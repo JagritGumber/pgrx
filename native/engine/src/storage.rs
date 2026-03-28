@@ -238,6 +238,15 @@ pub fn insert_checked(
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
+    // Reject NULL in any PK column (PK implies NOT NULL)
+    for &pk_col in pk_cols {
+        if pk_col < row.len() && matches!(row[pk_col], Value::Null) {
+            return Err(
+                "null value in column violates not-null constraint".to_string(),
+            );
+        }
+    }
+
     // Composite PK check — O(1) via hash index
     if pk_cols.len() > 1 {
         if let Some(ref pk_idx) = table.pk_index {
@@ -282,7 +291,7 @@ pub fn insert_batch_checked(
     rows: Vec<Row>,
     unique_checks: &[(usize, String)],
     pk_cols: &[usize],
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let tbl = get_table(schema, name)?;
     let mut table = tbl.write();
 
@@ -291,6 +300,15 @@ pub fn insert_batch_checked(
     let mut batch_pk: HashSet<Vec<Value>> = HashSet::new();
 
     for row in rows.iter() {
+        // Reject NULL in any PK column (PK implies NOT NULL)
+        for &pk_col in pk_cols {
+            if pk_col < row.len() && matches!(row[pk_col], Value::Null) {
+                return Err(
+                    "null value in column violates not-null constraint".to_string(),
+                );
+            }
+        }
+
         // Composite PK check — O(1) against index + batch set
         if pk_cols.len() > 1 {
             let key: Vec<Value> = pk_cols.iter().map(|&ci| row[ci].clone()).collect();
@@ -334,11 +352,12 @@ pub fn insert_batch_checked(
     }
 
     // All validated — push all atomically and update indexes
+    let base_row_id = table.rows.len();
     for row in rows {
         add_to_indexes(&mut table, &row);
         table.rows.push(row);
     }
-    Ok(())
+    Ok(base_row_id)
 }
 
 /// Update matching rows with validation. Returns error if any updater fails.

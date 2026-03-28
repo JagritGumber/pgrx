@@ -302,9 +302,23 @@ fn exec_create_table(
                         x if x == pg_query::protobuf::ConstrType::ConstrDefault as i32 => {
                             // Parse DEFAULT expression
                             if let Some(raw) = c.raw_expr.as_ref().and_then(|n| n.node.as_ref()) {
-                                default_expr = Some(catalog::DefaultExpr::Literal(
-                                    eval_const(Some(raw)),
-                                ));
+                                match raw {
+                                    NodeEnum::FuncCall(fc) => {
+                                        let func_name: String = fc.funcname.iter()
+                                            .filter_map(|n| n.node.as_ref())
+                                            .filter_map(|n| if let NodeEnum::String(s) = n { Some(s.sval.as_str()) } else { None })
+                                            .collect::<Vec<_>>().join(".");
+                                        return Err(format!(
+                                            "DEFAULT function expressions are not yet supported: {}",
+                                            func_name
+                                        ));
+                                    }
+                                    _ => {
+                                        default_expr = Some(catalog::DefaultExpr::Literal(
+                                            eval_const(Some(raw)),
+                                        ));
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -661,7 +675,6 @@ fn exec_insert(
     // then insert all at once. If any row fails, nothing is committed. (#4)
     let (unique_checks, pk_cols) = build_unique_checks(&table_def);
     let row_count = all_rows.len() as u64;
-    let inserted_rows = if has_returning { all_rows.clone() } else { Vec::new() };
 
     // Auto-create HNSW index on first INSERT if table has a vector column
     let vector_col_idx = table_def
@@ -678,36 +691,22 @@ fn exec_insert(
         );
     }
 
-    // Collect vectors for HNSW insertion (before batch moves the rows)
-    let hnsw_vectors: Vec<(usize, Vec<f32>)> = if let Some(col_idx) = vector_col_idx {
-        if storage::has_hnsw_index(schema, table_name).is_some() {
-            // Get current row count to compute row_ids for the new rows
-            let base_row_id = storage::row_count(schema, table_name).unwrap_or(0) as usize;
-            all_rows
-                .iter()
-                .enumerate()
-                .filter_map(|(i, row)| {
-                    if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
-                        Some((base_row_id + i, v.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let needs_row_copy = has_returning || vector_col_idx.is_some();
+    let inserted_rows = if needs_row_copy { all_rows.clone() } else { Vec::new() };
 
-    storage::insert_batch_checked(
+    let base_row_id = storage::insert_batch_checked(
         schema, table_name, all_rows, &unique_checks, &pk_cols,
     )?;
 
-    // Insert vectors into HNSW index after successful row insertion
-    for (row_id, vector) in hnsw_vectors {
-        let _ = storage::hnsw_insert(schema, table_name, row_id, vector);
+    // Insert vectors into HNSW index using the correct base_row_id from inside the write lock
+    if let Some(col_idx) = vector_col_idx {
+        if storage::has_hnsw_index(schema, table_name).is_some() {
+            for (i, row) in inserted_rows.iter().enumerate() {
+                if let Some(crate::types::Value::Vector(v)) = row.get(col_idx) {
+                    let _ = storage::hnsw_insert(schema, table_name, base_row_id + i, v.clone());
+                }
+            }
+        }
     }
 
     let tag = format!("INSERT 0 {}", row_count);
@@ -4893,5 +4892,36 @@ mod tests {
             overlap,
             k
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn hnsw_insert_correct_row_ids() {
+        setup();
+        execute("CREATE TABLE vec_t (id INT, v VECTOR)").unwrap();
+        execute("INSERT INTO vec_t VALUES (1, '[1,0,0]'), (2, '[0,1,0]'), (3, '[0,0,1]')").unwrap();
+        // KNN should find the correct nearest neighbor
+        let r = execute("SELECT id FROM vec_t ORDER BY v <-> '[1,0,0]' LIMIT 1").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("1".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pk_null_rejected_at_storage() {
+        setup();
+        execute("CREATE TABLE pk_t (id INT PRIMARY KEY, name TEXT)").unwrap();
+        // This should fail - NULL in a PK column must be rejected
+        let r = execute("INSERT INTO pk_t VALUES (NULL, 'test')");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_function_error() {
+        setup();
+        let r = execute("CREATE TABLE df_t (id INT, created_at TEXT DEFAULT now())");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not yet supported"));
     }
 }
