@@ -416,6 +416,51 @@ pub fn update_rows_checked(
     Ok(count)
 }
 
+/// Replace specific rows by index with pre-computed new values.
+/// Used by UPDATE ... FROM where matches are computed externally.
+pub fn update_rows_by_index(
+    schema: &str,
+    name: &str,
+    replacements: std::collections::HashMap<usize, Row>,
+) -> Result<u64, String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+
+    let count = replacements.len() as u64;
+    let mut new_rows = table.rows.clone();
+    for (idx, new_row) in replacements {
+        if idx < new_rows.len() {
+            new_rows[idx] = new_row;
+        }
+    }
+    table.rows = new_rows;
+    rebuild_indexes(&mut table);
+    Ok(count)
+}
+
+/// Delete rows at specific indices. Returns deleted rows for RETURNING.
+pub fn delete_by_indices(
+    schema: &str,
+    name: &str,
+    indices: &std::collections::HashSet<usize>,
+) -> Result<Vec<Row>, String> {
+    let tbl = get_table(schema, name)?;
+    let mut table = tbl.write();
+
+    let mut deleted = Vec::with_capacity(indices.len());
+    let mut kept = Vec::with_capacity(table.rows.len() - indices.len());
+    for (i, row) in table.rows.drain(..).enumerate() {
+        if indices.contains(&i) {
+            deleted.push(row);
+        } else {
+            kept.push(row);
+        }
+    }
+    table.rows = kept;
+    rebuild_indexes(&mut table);
+    Ok(deleted)
+}
+
 /// Delete all rows and return them (for DELETE ... RETURNING without WHERE).
 /// Single write lock — no TOCTOU race.
 pub fn delete_all_returning(schema: &str, name: &str) -> Result<Vec<Row>, String> {

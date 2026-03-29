@@ -100,8 +100,8 @@ The standard 7-step review (Memory, Modularity, Security, Best Practices, Speed,
 
 Currently supported:
 - DDL: CREATE TABLE (IF NOT EXISTS), DROP TABLE (IF EXISTS), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE TABLE AS SELECT
-- DML: INSERT (VALUES + SELECT), SELECT, UPDATE, DELETE, TRUNCATE (all with RETURNING)
-- Queries: WHERE, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT, BETWEEN
+- DML: INSERT (VALUES + SELECT), SELECT, UPDATE (+ FROM), DELETE (+ USING), TRUNCATE (all with RETURNING)
+- Queries: WHERE, ORDER BY (+ expression alias), LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT, BETWEEN
 - Set operations: UNION, UNION ALL, INTERSECT, EXCEPT
 - JOINs: INNER, LEFT, RIGHT, FULL, CROSS, implicit (hash join for equi, nested loop for theta)
 - Subqueries: IN, EXISTS, scalar, ALL, derived tables (correlated supported)
@@ -115,8 +115,6 @@ Currently supported:
 - Vector: <-> (L2), <=> (cosine), <#> (inner product), ORDER BY distance LIMIT K
 
 NOT yet supported (known gaps):
-- UPDATE FROM / DELETE USING (cross-table mutations)
-- ORDER BY expression alias
 - Transactions (BEGIN/COMMIT/ROLLBACK)
 - Persistent storage (WAL, disk)
 - Indexes (B-tree) — HNSW done

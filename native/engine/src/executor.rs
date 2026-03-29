@@ -3570,7 +3570,38 @@ fn resolve_sort_keys_with_exprs(
         if let Some(NodeEnum::SortBy(sb)) = snode.node.as_ref() {
             let inner = sb.node.as_ref().and_then(|n| n.node.as_ref());
             let col_idx = match inner {
-                Some(NodeEnum::ColumnRef(cref)) => resolve_column(cref, ctx)?,
+                Some(NodeEnum::ColumnRef(cref)) => {
+                    // Try source column first, then fall back to SELECT alias
+                    match resolve_column(cref, ctx) {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            let col_name = extract_col_name(cref);
+                            // Search SELECT target list for matching alias
+                            let mut found = None;
+                            for target in &select.target_list {
+                                if let Some(NodeEnum::ResTarget(rt)) = target.node.as_ref() {
+                                    if rt.name.eq_ignore_ascii_case(&col_name) {
+                                        if let Some(ref val_node) = rt.val {
+                                            if let Some(expr) = val_node.node.as_ref() {
+                                                found = Some(expr);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            match found {
+                                Some(expr_node) => {
+                                    let idx = next_col;
+                                    next_col += 1;
+                                    expr_nodes.push((keys.len(), expr_node));
+                                    idx
+                                }
+                                None => return Err(format!("column \"{}\" does not exist", col_name)),
+                            }
+                        }
+                    }
+                }
                 Some(NodeEnum::AConst(ac)) => {
                     let ordinal = match &ac.val {
                         Some(pg_query::protobuf::a_const::Val::Ival(i)) => i.ival as usize,
@@ -4261,9 +4292,14 @@ fn exec_delete(
         .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
     let has_returning = !delete.returning_list.is_empty();
 
+    // ── DELETE ... USING (cross-table join delete) ───────────────────
+    if !delete.using_clause.is_empty() {
+        return exec_delete_using(delete, schema, table_name, &table_def, has_returning);
+    }
+
+    // ── Simple DELETE (no USING) ─────────────────────────────────────
     let (count, deleted_rows) = if delete.where_clause.is_some() {
         let ctx = JoinContext::single(schema, table_name, table_def.clone());
-        // Validate WHERE clause — single arena shared across all rows.
         let mut validate_arena = QueryArena::new();
         storage::scan_with(schema, table_name, |all_rows| {
             for row in all_rows {
@@ -4306,6 +4342,81 @@ fn exec_delete(
     }
 }
 
+/// DELETE ... USING: cross-table join delete.
+/// For each target row, if any USING row matches the WHERE condition,
+/// the target row is deleted.
+fn exec_delete_using(
+    delete: &pg_query::protobuf::DeleteStmt,
+    schema: &str,
+    table_name: &str,
+    table_def: &Table,
+    has_returning: bool,
+) -> Result<QueryResult, String> {
+    let target_ncols = table_def.columns.len();
+
+    // Load USING tables
+    let mut arena = QueryArena::new();
+    let (using_rows, using_ctx) = execute_from_clause(&delete.using_clause, &mut arena)?;
+
+    // Build combined context: target table first, then USING tables
+    let mut sources = vec![JoinSource {
+        alias: table_name.to_string(),
+        table_name: table_name.to_string(),
+        schema: schema.to_string(),
+        table_def: table_def.clone(),
+        col_offset: 0,
+    }];
+    for mut src in using_ctx.sources {
+        src.col_offset += target_ncols;
+        sources.push(src);
+    }
+    let joined_ctx = JoinContext {
+        total_columns: target_ncols + using_ctx.total_columns,
+        sources,
+    };
+
+    // Convert USING rows to Value space
+    let using_value_rows: Vec<Vec<Value>> = using_rows
+        .iter()
+        .map(|row| row.iter().map(|av| av.to_value(&arena)).collect())
+        .collect();
+
+    // Find target row indices that match any USING row
+    let mut delete_indices = std::collections::HashSet::new();
+    let mut pred_arena = QueryArena::new();
+
+    let target_rows: Vec<Vec<Value>> = storage::scan_with(schema, table_name, |all_rows| {
+        Ok(all_rows.to_vec())
+    })?;
+
+    for (target_idx, target_row) in target_rows.iter().enumerate() {
+        for using_row in &using_value_rows {
+            let mut joined = Vec::with_capacity(joined_ctx.total_columns);
+            joined.extend_from_slice(target_row);
+            joined.extend_from_slice(using_row);
+
+            let matches = eval_where_value(
+                &delete.where_clause, &joined, &joined_ctx, &mut pred_arena,
+            ).unwrap_or(false);
+
+            if matches {
+                delete_indices.insert(target_idx);
+                break; // one match is enough to delete this row
+            }
+        }
+    }
+
+    let deleted_rows = storage::delete_by_indices(schema, table_name, &delete_indices)?;
+    let count = deleted_rows.len() as u64;
+
+    let tag = format!("DELETE {}", count);
+    if has_returning {
+        eval_returning(&delete.returning_list, &deleted_rows, table_def, schema, table_name, &tag)
+    } else {
+        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
+}
+
 // ── UPDATE ────────────────────────────────────────────────────────────
 
 fn exec_update(
@@ -4324,7 +4435,6 @@ fn exec_update(
 
     let table_def = catalog::get_table(schema, table_name)
         .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
-    let ctx = JoinContext::single(schema, table_name, table_def.clone());
 
     let mut assignments: Vec<(usize, NodeEnum)> = Vec::new();
     for target in &update.target_list {
@@ -4344,7 +4454,17 @@ fn exec_update(
         }
     }
 
-    // Validate WHERE clause — single arena shared across all rows.
+    let has_returning = !update.returning_list.is_empty();
+
+    // ── UPDATE ... FROM (cross-table join update) ────────────────────
+    if !update.from_clause.is_empty() {
+        return exec_update_from(update, schema, table_name, &table_def, &assignments, has_returning);
+    }
+
+    // ── Simple UPDATE (no FROM) ──────────────────────────────────────
+    let ctx = JoinContext::single(schema, table_name, table_def.clone());
+
+    // Validate WHERE clause
     let mut validate_arena = QueryArena::new();
     storage::scan_with(schema, table_name, |all_rows| {
         for row in all_rows {
@@ -4355,10 +4475,8 @@ fn exec_update(
 
     let wc = update.where_clause.clone();
     let td = table_def.clone();
-    let assigns = assignments.clone();
     let ctx2 = JoinContext::single(schema, table_name, td.clone());
 
-    let has_returning = !update.returning_list.is_empty();
     let mut updated_rows: Vec<Vec<Value>> = Vec::new();
     let mut pred_arena = QueryArena::new();
     let mut expr_arena = QueryArena::new();
@@ -4370,7 +4488,7 @@ fn exec_update(
         |row| {
             let ctx_inner = JoinContext::single(schema, table_name, td.clone());
             let mut new_row = row.clone();
-            for (col_idx, expr_node) in &assigns {
+            for (col_idx, expr_node) in &assignments {
                 new_row[*col_idx] = eval_expr_value(expr_node, row, &ctx_inner, &mut expr_arena)?;
             }
             check_not_null(&td, &new_row)?;
@@ -4387,6 +4505,96 @@ fn exec_update(
     let tag = format!("UPDATE {}", count);
     if has_returning {
         eval_returning(&update.returning_list, &updated_rows, &table_def, schema, table_name, &tag)
+    } else {
+        Ok(QueryResult { tag, columns: vec![], rows: vec![] })
+    }
+}
+
+/// UPDATE ... FROM: cross-table update via join.
+/// For each target row, finds the first matching FROM row and applies SET
+/// using the joined context (target columns + FROM columns).
+fn exec_update_from(
+    update: &pg_query::protobuf::UpdateStmt,
+    schema: &str,
+    table_name: &str,
+    table_def: &Table,
+    assignments: &[(usize, NodeEnum)],
+    has_returning: bool,
+) -> Result<QueryResult, String> {
+    let target_ncols = table_def.columns.len();
+
+    // Load FROM tables into arena
+    let mut arena = QueryArena::new();
+    let (from_rows, from_ctx) = execute_from_clause(&update.from_clause, &mut arena)?;
+
+    // Build combined context: target table first, then FROM tables
+    let mut sources = vec![JoinSource {
+        alias: table_name.to_string(),
+        table_name: table_name.to_string(),
+        schema: schema.to_string(),
+        table_def: table_def.clone(),
+        col_offset: 0,
+    }];
+    for mut src in from_ctx.sources {
+        src.col_offset += target_ncols;
+        sources.push(src);
+    }
+    let joined_ctx = JoinContext {
+        total_columns: target_ncols + from_ctx.total_columns,
+        sources,
+    };
+
+    // Convert FROM rows from ArenaValue to Value for DML bridge functions
+    let from_value_rows: Vec<Vec<Value>> = from_rows
+        .iter()
+        .map(|row| row.iter().map(|av| av.to_value(&arena)).collect())
+        .collect();
+
+    // For each target row, find first matching FROM row and compute new values.
+    let mut update_map: std::collections::HashMap<usize, Vec<Value>> = std::collections::HashMap::new();
+    let mut updated_rows_for_returning: Vec<Vec<Value>> = Vec::new();
+    let mut pred_arena = QueryArena::new();
+    let mut expr_arena = QueryArena::new();
+
+    let target_rows: Vec<Vec<Value>> = storage::scan_with(schema, table_name, |all_rows| {
+        Ok(all_rows.to_vec())
+    })?;
+
+    for (target_idx, target_row) in target_rows.iter().enumerate() {
+        for from_row in &from_value_rows {
+            // Build joined Value row: [target_cols... | from_cols...]
+            let mut joined = Vec::with_capacity(joined_ctx.total_columns);
+            joined.extend_from_slice(target_row);
+            joined.extend_from_slice(from_row);
+
+            let matches = eval_where_value(
+                &update.where_clause, &joined, &joined_ctx, &mut pred_arena,
+            ).unwrap_or(false);
+
+            if matches {
+                let mut new_row = target_row.clone();
+                for (col_idx, expr_node) in assignments {
+                    new_row[*col_idx] = eval_expr_value(expr_node, &joined, &joined_ctx, &mut expr_arena)?;
+                }
+                check_not_null(table_def, &new_row)?;
+                if has_returning {
+                    updated_rows_for_returning.push(new_row.clone());
+                }
+                update_map.insert(target_idx, new_row);
+                break; // first match wins per PostgreSQL semantics
+            }
+        }
+    }
+
+    // Apply pre-computed updates by index
+    let count = update_map.len() as u64;
+    if count > 0 {
+        storage::update_rows_by_index(schema, table_name, update_map)?;
+    }
+
+    let tag = format!("UPDATE {}", count);
+    if has_returning {
+        eval_returning(&update.returning_list, &updated_rows_for_returning, table_def, schema, table_name, &tag)
     } else {
         Ok(QueryResult { tag, columns: vec![], rows: vec![] })
     }
@@ -6360,7 +6568,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    #[ignore = "ORDER BY alias resolution not yet implemented"]
     fn expression_aliases_in_order_by() {
         setup();
         execute("CREATE TABLE ea (price INT, qty INT)").unwrap();
@@ -6407,7 +6614,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    #[ignore = "UPDATE FROM not yet implemented"]
     fn update_from_join() {
         setup();
         execute("CREATE TABLE prices (id INT, price INT)").unwrap();
@@ -6424,7 +6630,6 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    #[ignore = "DELETE USING not yet implemented"]
     fn delete_using() {
         setup();
         execute("CREATE TABLE items (id INT, name TEXT)").unwrap();
