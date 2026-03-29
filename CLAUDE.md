@@ -99,19 +99,24 @@ The standard 7-step review (Memory, Modularity, Security, Best Practices, Speed,
 ## SQL Feature Completeness
 
 Currently supported:
-- DDL: CREATE TABLE, DROP TABLE (with PK, UNIQUE, NOT NULL, DEFAULT, SERIAL)
-- DML: INSERT, SELECT, UPDATE, DELETE, TRUNCATE (all with RETURNING)
-- Queries: WHERE, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT
+- DDL: CREATE TABLE (IF NOT EXISTS), DROP TABLE (IF EXISTS), ALTER TABLE (ADD/DROP/RENAME COLUMN, RENAME TABLE), CREATE TABLE AS SELECT
+- DML: INSERT (VALUES + SELECT), SELECT, UPDATE, DELETE, TRUNCATE (all with RETURNING)
+- Queries: WHERE, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT, BETWEEN
+- Set operations: UNION, UNION ALL, INTERSECT, EXCEPT
 - JOINs: INNER, LEFT, RIGHT, FULL, CROSS, implicit (hash join for equi, nested loop for theta)
 - Subqueries: IN, EXISTS, scalar, ALL, derived tables (correlated supported)
-- Expressions: arithmetic, comparison, boolean logic, IS NULL, LIKE, ILIKE, CASE WHEN
-- Functions: upper, lower, length, concat, abs, nextval, currval, setval
+- Expressions: arithmetic (+ - * / %), comparison, boolean logic, IS NULL, LIKE, ILIKE, CASE WHEN, COALESCE, NULLIF
+- Aggregates: COUNT, SUM, AVG, MIN, MAX, STRING_AGG, BOOL_AND, BOOL_OR (with DISTINCT support)
+- String functions: upper, lower, length, concat, substring, trim, replace, position, left, right
+- Math functions: abs, ceil, floor, round, mod, power, sqrt
+- Sequence functions: nextval, currval, setval
+- Type casting: ::int, ::float8, ::text, ::bool, ::vector, CAST(x AS type)
 - Types: int, bigint, float, text, bool, bytea, vector
 - Vector: <-> (L2), <=> (cosine), <#> (inner product), ORDER BY distance LIMIT K
 
 NOT yet supported (known gaps):
-- ALTER TABLE
-- Type casting (::int, CAST) — partial, needs completion
+- UPDATE FROM / DELETE USING (cross-table mutations)
+- ORDER BY expression alias
 - Transactions (BEGIN/COMMIT/ROLLBACK)
 - Persistent storage (WAL, disk)
 - Indexes (B-tree) — HNSW done

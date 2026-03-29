@@ -517,6 +517,48 @@ pub fn get_rows_by_ids(schema: &str, name: &str, ids: &[usize]) -> Result<Vec<Ro
 }
 
 #[allow(dead_code)]
+/// Add a column to all existing rows (appends default_val to each row).
+pub fn alter_add_column(schema: &str, name: &str, default_val: Value) {
+    if let Ok(table) = get_table(schema, name) {
+        let mut t = table.write();
+        for row in &mut t.rows {
+            row.push(default_val.clone());
+        }
+    }
+}
+
+/// Drop a column from all existing rows by index.
+pub fn alter_drop_column(schema: &str, name: &str, col_idx: usize) {
+    if let Ok(table) = get_table(schema, name) {
+        let mut t = table.write();
+        for row in &mut t.rows {
+            if col_idx < row.len() {
+                row.remove(col_idx);
+            }
+        }
+        // Rebuild unique indexes since column indices shifted
+        t.unique_indexes.clear();
+    }
+}
+
+/// Rename a table in storage.
+pub fn rename_table(schema: &str, old_name: &str, new_name: &str) {
+    let mut store = STORE.write();
+    let old_key = key(schema, old_name);
+    let new_key = key(schema, new_name);
+    if let Some(table) = store.remove(&old_key) {
+        store.insert(new_key, table);
+    }
+}
+
+/// Batch insert without constraint checks (for CTAS, INSERT...SELECT).
+pub fn insert_batch(schema: &str, name: &str, rows: Vec<Row>) {
+    if let Ok(table) = get_table(schema, name) {
+        let mut t = table.write();
+        t.rows.extend(rows);
+    }
+}
+
 pub fn reset() {
     let mut store = STORE.write();
     store.clear();

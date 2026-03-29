@@ -93,6 +93,60 @@ pub fn list_tables(schema: &str) -> Vec<Table> {
         .collect()
 }
 
+pub fn alter_table_add_column(schema: &str, table_name: &str, col: Column) -> Result<(), String> {
+    let mut cat = CATALOG.write();
+    let key = fqn(schema, table_name);
+    let table = cat.tables.get_mut(&key)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    if table.columns.iter().any(|c| c.name == col.name) {
+        return Err(format!("column \"{}\" of relation \"{}\" already exists", col.name, table_name));
+    }
+    table.columns.push(col);
+    Ok(())
+}
+
+pub fn alter_table_drop_column(schema: &str, table_name: &str, col_name: &str) -> Result<(), String> {
+    let mut cat = CATALOG.write();
+    let key = fqn(schema, table_name);
+    let table = cat.tables.get_mut(&key)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    let idx = table.columns.iter().position(|c| c.name == col_name)
+        .ok_or_else(|| format!("column \"{}\" does not exist", col_name))?;
+    table.columns.remove(idx);
+    Ok(())
+}
+
+pub fn get_column_index(schema: &str, table_name: &str, col_name: &str) -> Result<usize, String> {
+    let cat = CATALOG.read();
+    let key = fqn(schema, table_name);
+    let table = cat.tables.get(&key)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    table.columns.iter().position(|c| c.name == col_name)
+        .ok_or_else(|| format!("column \"{}\" does not exist", col_name))
+}
+
+pub fn rename_table(schema: &str, old_name: &str, new_name: &str) -> Result<(), String> {
+    let mut cat = CATALOG.write();
+    let old_key = fqn(schema, old_name);
+    let new_key = fqn(schema, new_name);
+    let mut table = cat.tables.remove(&old_key)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", old_name))?;
+    table.name = new_name.to_string();
+    cat.tables.insert(new_key, table);
+    Ok(())
+}
+
+pub fn rename_column(schema: &str, table_name: &str, old_name: &str, new_name: &str) -> Result<(), String> {
+    let mut cat = CATALOG.write();
+    let key = fqn(schema, table_name);
+    let table = cat.tables.get_mut(&key)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table_name))?;
+    let col = table.columns.iter_mut().find(|c| c.name == old_name)
+        .ok_or_else(|| format!("column \"{}\" does not exist", old_name))?;
+    col.name = new_name.to_string();
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn reset() {
     let mut cat = CATALOG.write();
