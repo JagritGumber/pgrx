@@ -1493,6 +1493,29 @@ fn eval_bool_expr(
     }
 }
 
+/// Deduplicate rows when DISTINCT is present. No-op if distinct_clause is empty.
+fn dedup_distinct(
+    distinct_clause: &[pg_query::protobuf::Node],
+    rows: Vec<Vec<ArenaValue>>,
+    arena: &QueryArena,
+) -> Vec<Vec<ArenaValue>> {
+    if distinct_clause.is_empty() {
+        return rows;
+    }
+    let mut unique: Vec<Vec<ArenaValue>> = Vec::new();
+    'outer: for row in rows {
+        for existing in &unique {
+            if existing.len() == row.len()
+                && existing.iter().zip(row.iter()).all(|(a, b)| a.eq_with(b, arena))
+            {
+                continue 'outer;
+            }
+        }
+        unique.push(row);
+    }
+    unique
+}
+
 /// Evaluate CASE WHEN ... THEN ... ELSE ... END expressions.
 /// Two forms: simple CASE (has arg) and searched CASE (no arg).
 fn eval_case_expr(
@@ -1558,8 +1581,15 @@ fn eval_case_expr(
 /// SQL LIKE pattern matching. `%` matches any sequence, `_` matches one char.
 /// Backslash escapes the next character (e.g., `\%` matches literal `%`).
 fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
-    let text = if case_insensitive { text.to_lowercase() } else { text.to_string() };
-    let pattern = if case_insensitive { pattern.to_lowercase() } else { pattern.to_string() };
+    let text_owned;
+    let pattern_owned;
+    let (text, pattern) = if case_insensitive {
+        text_owned = text.to_lowercase();
+        pattern_owned = pattern.to_lowercase();
+        (text_owned.as_str(), pattern_owned.as_str())
+    } else {
+        (text, pattern)
+    };
 
     let t: Vec<char> = text.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
@@ -2809,7 +2839,9 @@ fn exec_select_raw_post_filter(
             })
             .collect();
 
-        // Apply ORDER BY to aggregate results (Bug #2 / #7 fix)
+        // SQL order: DISTINCT → ORDER BY → OFFSET → LIMIT
+        value_rows = dedup_distinct(&select.distinct_clause, value_rows, arena);
+
         if !select.sort_clause.is_empty() {
             let sort_keys = resolve_aggregate_sort_keys(
                 &select.sort_clause, &agg_result.columns, &merged_ctx, select,
@@ -2817,7 +2849,6 @@ fn exec_select_raw_post_filter(
             value_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
         }
 
-        // Apply OFFSET
         if let Some(ref offset_node) = select.limit_offset {
             if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
                 let n = n.max(0) as usize;
@@ -2829,27 +2860,10 @@ fn exec_select_raw_post_filter(
             }
         }
 
-        // Apply LIMIT
         if let Some(ref limit_node) = select.limit_count {
             if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
                 value_rows.truncate(n.max(0) as usize);
             }
-        }
-
-        // DISTINCT on aggregate results
-        if !select.distinct_clause.is_empty() {
-            let mut unique: Vec<Vec<ArenaValue>> = Vec::new();
-            'agg_outer: for row in value_rows {
-                for existing in &unique {
-                    if existing.len() == row.len()
-                        && existing.iter().zip(row.iter()).all(|(a, b)| a.eq_with(b, arena))
-                    {
-                        continue 'agg_outer;
-                    }
-                }
-                unique.push(row);
-            }
-            value_rows = unique;
         }
 
         return Ok((agg_result.columns, value_rows));
@@ -2860,7 +2874,6 @@ fn exec_select_raw_post_filter(
         let (sort_keys, expr_count) =
             resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows, arena)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
-        // Strip temporary expression columns appended for sorting
         if expr_count > 0 {
             for row in rows.iter_mut() {
                 row.truncate(row.len() - expr_count);
@@ -2868,26 +2881,8 @@ fn exec_select_raw_post_filter(
         }
     }
 
-    // OFFSET
-    if let Some(ref offset_node) = select.limit_offset {
-        if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
-            let n = n.max(0) as usize;
-            if n >= rows.len() {
-                rows.clear();
-            } else {
-                rows.drain(0..n);
-            }
-        }
-    }
-
-    // LIMIT
-    if let Some(ref limit_node) = select.limit_count {
-        if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
-            rows.truncate(n.max(0) as usize);
-        }
-    }
-
-    // Resolve targets and project
+    // Project before DISTINCT/OFFSET/LIMIT (SQL order: PROJECT → DISTINCT → ORDER BY → OFFSET → LIMIT)
+    // ORDER BY already applied above on full rows; now project to output columns
     let targets = resolve_targets(select, &merged_ctx)?;
     let columns: Vec<(String, i32)> = targets
         .iter()
@@ -2899,7 +2894,6 @@ fn exec_select_raw_post_filter(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    
     let mut result_rows = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
@@ -2907,7 +2901,7 @@ fn exec_select_raw_post_filter(
             let val = match t {
                 SelectTarget::Column { idx, .. } => {
                     if *idx < row.len() {
-                        row[*idx] // ArenaValue is Copy
+                        row[*idx]
                     } else {
                         return Err(format!(
                             "internal error: column index {} out of range for row of width {}",
@@ -2924,20 +2918,24 @@ fn exec_select_raw_post_filter(
         result_rows.push(result_row);
     }
 
-    // DISTINCT deduplication (after projection, preserving ORDER BY)
-    if !select.distinct_clause.is_empty() {
-        let mut unique: Vec<Vec<ArenaValue>> = Vec::new();
-        'outer: for row in result_rows {
-            for existing in &unique {
-                if existing.len() == row.len()
-                    && existing.iter().zip(row.iter()).all(|(a, b)| a.eq_with(b, arena))
-                {
-                    continue 'outer;
-                }
+    // SQL order: DISTINCT → OFFSET → LIMIT (after projection and ORDER BY)
+    result_rows = dedup_distinct(&select.distinct_clause, result_rows, arena);
+
+    if let Some(ref offset_node) = select.limit_offset {
+        if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
+            let n = n.max(0) as usize;
+            if n >= result_rows.len() {
+                result_rows.clear();
+            } else {
+                result_rows.drain(0..n);
             }
-            unique.push(row);
         }
-        result_rows = unique;
+    }
+
+    if let Some(ref limit_node) = select.limit_count {
+        if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
+            result_rows.truncate(n.max(0) as usize);
+        }
     }
 
     Ok((columns, result_rows))
@@ -5315,6 +5313,30 @@ mod tests {
         execute("INSERT INTO dup3 VALUES (1, 'x'), (1, 'y'), (1, 'x'), (2, 'x')").unwrap();
         let r = execute("SELECT DISTINCT a, b FROM dup3 ORDER BY a, b").unwrap();
         assert_eq!(r.rows.len(), 3); // (1,x), (1,y), (2,x)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn like_escaped_percent() {
+        setup();
+        execute("CREATE TABLE like6 (s TEXT)").unwrap();
+        execute("INSERT INTO like6 VALUES ('100%'), ('100x'), ('100')").unwrap();
+        let r = execute(r#"SELECT s FROM like6 WHERE s LIKE '100\%'"#).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("100%".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_with_limit() {
+        setup();
+        execute("CREATE TABLE dup5 (x INT)").unwrap();
+        execute("INSERT INTO dup5 VALUES (1), (1), (2), (2), (3), (3)").unwrap();
+        // DISTINCT first (3 unique), then LIMIT 2
+        let r = execute("SELECT DISTINCT x FROM dup5 ORDER BY x LIMIT 2").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
     }
 
     #[test]
