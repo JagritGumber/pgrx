@@ -101,23 +101,20 @@ The standard 7-step review (Memory, Modularity, Security, Best Practices, Speed,
 Currently supported:
 - DDL: CREATE TABLE, DROP TABLE (with PK, UNIQUE, NOT NULL, DEFAULT, SERIAL)
 - DML: INSERT, SELECT, UPDATE, DELETE, TRUNCATE (all with RETURNING)
-- Queries: WHERE, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT (partial)
+- Queries: WHERE, ORDER BY, LIMIT, OFFSET, GROUP BY, HAVING, DISTINCT
 - JOINs: INNER, LEFT, RIGHT, FULL, CROSS, implicit (hash join for equi, nested loop for theta)
 - Subqueries: IN, EXISTS, scalar, ALL, derived tables (correlated supported)
-- Expressions: arithmetic, comparison, boolean logic, IS NULL, LIKE (missing), CASE (missing)
+- Expressions: arithmetic, comparison, boolean logic, IS NULL, LIKE, ILIKE, CASE WHEN
 - Functions: upper, lower, length, concat, abs, nextval, currval, setval
 - Types: int, bigint, float, text, bool, bytea, vector
 - Vector: <-> (L2), <=> (cosine), <#> (inner product), ORDER BY distance LIMIT K
 
 NOT yet supported (known gaps):
 - ALTER TABLE
-- LIKE / ILIKE
-- CASE WHEN ... THEN ... END
-- DISTINCT (full)
-- Type casting (::int, CAST)
+- Type casting (::int, CAST) — partial, needs completion
 - Transactions (BEGIN/COMMIT/ROLLBACK)
 - Persistent storage (WAL, disk)
-- Indexes (B-tree, HNSW)
+- Indexes (B-tree) — HNSW done
 - Write throughput (single-writer bottleneck)
 - Horizontal scaling
 - Vectorized/batch execution

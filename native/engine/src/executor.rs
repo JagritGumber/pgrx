@@ -1075,6 +1075,7 @@ fn eval_expr(node: &NodeEnum, row: &[ArenaValue], ctx: &JoinContext, arena: &mut
                 Ok(ArenaValue::Bool(!is_null))
             }
         }
+        NodeEnum::CaseExpr(case_expr) => eval_case_expr(case_expr, row, ctx, arena),
         NodeEnum::FuncCall(fc) => eval_func_call(fc, row, ctx, arena),
         NodeEnum::SubLink(sl) => {
             let inner = sl
@@ -1288,6 +1289,34 @@ fn eval_a_expr(
         return Err("IN requires a list on the right".into());
     }
 
+    // Handle LIKE / ILIKE / NOT LIKE / NOT ILIKE
+    if expr.kind == pg_query::protobuf::AExprKind::AexprLike as i32
+        || expr.kind == pg_query::protobuf::AExprKind::AexprIlike as i32
+    {
+        let left_node = expr.lexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("LIKE missing left operand")?;
+        let right_node = expr.rexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or("LIKE missing right operand")?;
+        let left = eval_expr(left_node, row, ctx, arena)?;
+        let right = eval_expr(right_node, row, ctx, arena)?;
+
+        if left.is_null() || right.is_null() {
+            return Ok(ArenaValue::Null);
+        }
+
+        let text = left.to_text(arena).unwrap_or_default();
+        let pattern = right.to_text(arena).unwrap_or_default();
+        let case_insensitive = expr.kind == pg_query::protobuf::AExprKind::AexprIlike as i32;
+
+        let matched = sql_like_match(&text, &pattern, case_insensitive);
+
+        // NOT LIKE / NOT ILIKE: pg_query uses "!~~" / "!~~*" as the operator name
+        let op_name = extract_op_name(&expr.name).unwrap_or_default();
+        let negated = op_name.starts_with("!") || op_name == "not like" || op_name == "not ilike";
+
+        return Ok(ArenaValue::Bool(if negated { !matched } else { matched }));
+    }
+
     let op = extract_op_name(&expr.name)?;
 
     // Unary minus
@@ -1462,6 +1491,149 @@ fn eval_bool_expr(
     } else {
         Err(format!("unsupported BoolExpr op: {}", boolop))
     }
+}
+
+/// Deduplicate rows when DISTINCT is present. No-op if distinct_clause is empty.
+fn dedup_distinct(
+    distinct_clause: &[pg_query::protobuf::Node],
+    rows: Vec<Vec<ArenaValue>>,
+    arena: &QueryArena,
+) -> Vec<Vec<ArenaValue>> {
+    if distinct_clause.is_empty() {
+        return rows;
+    }
+    let mut unique: Vec<Vec<ArenaValue>> = Vec::new();
+    'outer: for row in rows {
+        for existing in &unique {
+            if existing.len() == row.len()
+                && existing.iter().zip(row.iter()).all(|(a, b)| a.eq_with(b, arena))
+            {
+                continue 'outer;
+            }
+        }
+        unique.push(row);
+    }
+    unique
+}
+
+/// Evaluate CASE WHEN ... THEN ... ELSE ... END expressions.
+/// Two forms: simple CASE (has arg) and searched CASE (no arg).
+fn eval_case_expr(
+    case_expr: &pg_query::protobuf::CaseExpr,
+    row: &[ArenaValue],
+    ctx: &JoinContext,
+    arena: &mut QueryArena,
+) -> Result<ArenaValue, String> {
+    // Simple CASE: CASE expr WHEN val1 THEN res1 ...
+    // Searched CASE: CASE WHEN cond1 THEN res1 ...
+    let test_val = if let Some(ref arg) = case_expr.arg {
+        if let Some(ref node) = arg.node {
+            Some(eval_expr(node, row, ctx, arena)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    for when_node in &case_expr.args {
+        if let Some(NodeEnum::CaseWhen(when)) = when_node.node.as_ref() {
+            let cond_node = when.expr.as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or("CASE WHEN missing condition")?;
+
+            let matches = if let Some(ref tv) = test_val {
+                // Simple CASE: compare test value with WHEN value
+                let when_val = eval_expr(cond_node, row, ctx, arena)?;
+                if tv.is_null() || when_val.is_null() {
+                    false // NULL never matches in simple CASE
+                } else {
+                    tv.eq_with(&when_val, arena)
+                        || tv.compare(&when_val, arena) == Some(std::cmp::Ordering::Equal)
+                }
+            } else {
+                // Searched CASE: evaluate condition as boolean
+                match eval_expr(cond_node, row, ctx, arena)? {
+                    ArenaValue::Bool(b) => b,
+                    ArenaValue::Null => false, // NULL condition = not matched
+                    _ => false,
+                }
+            };
+
+            if matches {
+                let result_node = when.result.as_ref()
+                    .and_then(|n| n.node.as_ref())
+                    .ok_or("CASE WHEN missing result")?;
+                return eval_expr(result_node, row, ctx, arena);
+            }
+        }
+    }
+
+    // No WHEN matched — use ELSE or NULL
+    if let Some(ref def) = case_expr.defresult {
+        if let Some(ref node) = def.node {
+            return eval_expr(node, row, ctx, arena);
+        }
+    }
+    Ok(ArenaValue::Null)
+}
+
+/// SQL LIKE pattern matching. `%` matches any sequence, `_` matches one char.
+/// Backslash escapes the next character (e.g., `\%` matches literal `%`).
+fn sql_like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let text_owned;
+    let pattern_owned;
+    let (text, pattern) = if case_insensitive {
+        text_owned = text.to_lowercase();
+        pattern_owned = pattern.to_lowercase();
+        (text_owned.as_str(), pattern_owned.as_str())
+    } else {
+        (text, pattern)
+    };
+
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (tlen, plen) = (t.len(), p.len());
+
+    // dp[i][j] = true if text[0..i] matches pattern[0..j]
+    let mut dp = vec![vec![false; plen + 1]; tlen + 1];
+    dp[0][0] = true;
+
+    // Leading % can match empty string
+    for j in 1..=plen {
+        if p[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
+        } else {
+            break;
+        }
+    }
+
+    for i in 1..=tlen {
+        let mut j = 0;
+        while j < plen {
+            let pj = j;
+            let pc = if p[pj] == '\\' && pj + 1 < plen {
+                // Escaped character — match literally
+                j += 1; // consume the backslash
+                (p[j], true) // literal match
+            } else {
+                (p[pj], false)
+            };
+
+            if pc.1 {
+                // Escaped literal
+                dp[i][j + 1] = dp[i - 1][pj] && t[i - 1] == pc.0;
+            } else if pc.0 == '%' {
+                dp[i][j + 1] = dp[i][j] || dp[i - 1][j + 1];
+            } else if pc.0 == '_' {
+                dp[i][j + 1] = dp[i - 1][j];
+            } else {
+                dp[i][j + 1] = dp[i - 1][j] && t[i - 1] == pc.0;
+            }
+            j += 1;
+        }
+    }
+    dp[tlen][plen]
 }
 
 #[inline(always)]
@@ -2667,7 +2839,9 @@ fn exec_select_raw_post_filter(
             })
             .collect();
 
-        // Apply ORDER BY to aggregate results (Bug #2 / #7 fix)
+        // SQL order: DISTINCT → ORDER BY → OFFSET → LIMIT
+        value_rows = dedup_distinct(&select.distinct_clause, value_rows, arena);
+
         if !select.sort_clause.is_empty() {
             let sort_keys = resolve_aggregate_sort_keys(
                 &select.sort_clause, &agg_result.columns, &merged_ctx, select,
@@ -2675,7 +2849,6 @@ fn exec_select_raw_post_filter(
             value_rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
         }
 
-        // Apply OFFSET
         if let Some(ref offset_node) = select.limit_offset {
             if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
                 let n = n.max(0) as usize;
@@ -2687,7 +2860,6 @@ fn exec_select_raw_post_filter(
             }
         }
 
-        // Apply LIMIT
         if let Some(ref limit_node) = select.limit_count {
             if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
                 value_rows.truncate(n.max(0) as usize);
@@ -2702,7 +2874,6 @@ fn exec_select_raw_post_filter(
         let (sort_keys, expr_count) =
             resolve_sort_keys_with_exprs(&select.sort_clause, &merged_ctx, select, &mut rows, arena)?;
         rows.sort_by(|a, b| compare_rows(&sort_keys, a, b, arena));
-        // Strip temporary expression columns appended for sorting
         if expr_count > 0 {
             for row in rows.iter_mut() {
                 row.truncate(row.len() - expr_count);
@@ -2710,26 +2881,8 @@ fn exec_select_raw_post_filter(
         }
     }
 
-    // OFFSET
-    if let Some(ref offset_node) = select.limit_offset {
-        if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
-            let n = n.max(0) as usize;
-            if n >= rows.len() {
-                rows.clear();
-            } else {
-                rows.drain(0..n);
-            }
-        }
-    }
-
-    // LIMIT
-    if let Some(ref limit_node) = select.limit_count {
-        if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
-            rows.truncate(n.max(0) as usize);
-        }
-    }
-
-    // Resolve targets and project
+    // Project before DISTINCT/OFFSET/LIMIT (SQL order: PROJECT → DISTINCT → ORDER BY → OFFSET → LIMIT)
+    // ORDER BY already applied above on full rows; now project to output columns
     let targets = resolve_targets(select, &merged_ctx)?;
     let columns: Vec<(String, i32)> = targets
         .iter()
@@ -2741,7 +2894,6 @@ fn exec_select_raw_post_filter(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    
     let mut result_rows = Vec::new();
     for row in &rows {
         let mut result_row = Vec::new();
@@ -2749,7 +2901,7 @@ fn exec_select_raw_post_filter(
             let val = match t {
                 SelectTarget::Column { idx, .. } => {
                     if *idx < row.len() {
-                        row[*idx] // ArenaValue is Copy
+                        row[*idx]
                     } else {
                         return Err(format!(
                             "internal error: column index {} out of range for row of width {}",
@@ -2766,7 +2918,25 @@ fn exec_select_raw_post_filter(
         result_rows.push(result_row);
     }
 
-    
+    // SQL order: DISTINCT → OFFSET → LIMIT (after projection and ORDER BY)
+    result_rows = dedup_distinct(&select.distinct_clause, result_rows, arena);
+
+    if let Some(ref offset_node) = select.limit_offset {
+        if let Some(n) = eval_const_i64(offset_node.node.as_ref()) {
+            let n = n.max(0) as usize;
+            if n >= result_rows.len() {
+                result_rows.clear();
+            } else {
+                result_rows.drain(0..n);
+            }
+        }
+    }
+
+    if let Some(ref limit_node) = select.limit_count {
+        if let Some(n) = eval_const_i64(limit_node.node.as_ref()) {
+            result_rows.truncate(n.max(0) as usize);
+        }
+    }
 
     Ok((columns, result_rows))
 }
@@ -4992,5 +5162,193 @@ mod tests {
         let r = execute("CREATE TABLE df_t (id INT, created_at TEXT DEFAULT now())");
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("not yet supported"));
+    }
+
+    // ── LIKE / ILIKE tests ──────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn like_percent_wildcard() {
+        setup();
+        execute("CREATE TABLE likes (name TEXT)").unwrap();
+        execute("INSERT INTO likes VALUES ('alice'), ('bob'), ('alicia'), ('charlie')").unwrap();
+        let r = execute("SELECT name FROM likes WHERE name LIKE 'ali%' ORDER BY name").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("alice".into()));
+        assert_eq!(r.rows[1][0], Some("alicia".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn like_underscore_wildcard() {
+        setup();
+        execute("CREATE TABLE like2 (code TEXT)").unwrap();
+        execute("INSERT INTO like2 VALUES ('A1'), ('A2'), ('AB'), ('A12')").unwrap();
+        let r = execute("SELECT code FROM like2 WHERE code LIKE 'A_' ORDER BY code").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("A1".into()));
+        assert_eq!(r.rows[1][0], Some("A2".into()));
+        assert_eq!(r.rows[2][0], Some("AB".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn not_like() {
+        setup();
+        execute("CREATE TABLE like3 (name TEXT)").unwrap();
+        execute("INSERT INTO like3 VALUES ('foo'), ('bar'), ('foobar')").unwrap();
+        let r = execute("SELECT name FROM like3 WHERE name NOT LIKE 'foo%' ORDER BY name").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("bar".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ilike_case_insensitive() {
+        setup();
+        execute("CREATE TABLE like4 (name TEXT)").unwrap();
+        execute("INSERT INTO like4 VALUES ('Alice'), ('BOB'), ('alice')").unwrap();
+        let r = execute("SELECT name FROM like4 WHERE name ILIKE 'alice' ORDER BY name").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        // PostgreSQL: case-insensitive match returns both Alice and alice
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn like_null_propagation() {
+        setup();
+        execute("CREATE TABLE like5 (name TEXT)").unwrap();
+        execute("INSERT INTO like5 VALUES ('a'), (NULL)").unwrap();
+        let r = execute("SELECT name FROM like5 WHERE name LIKE '%'").unwrap();
+        assert_eq!(r.rows.len(), 1); // NULL LIKE '%' = NULL, excluded from WHERE
+    }
+
+    // ── CASE WHEN tests ─────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn case_searched() {
+        setup();
+        execute("CREATE TABLE scores (name TEXT, score INT)").unwrap();
+        execute("INSERT INTO scores VALUES ('a', 90), ('b', 60), ('c', 40)").unwrap();
+        let r = execute(
+            "SELECT name, CASE WHEN score >= 80 THEN 'A' WHEN score >= 50 THEN 'B' ELSE 'F' END FROM scores ORDER BY name"
+        ).unwrap();
+        assert_eq!(r.rows[0][1], Some("A".into()));
+        assert_eq!(r.rows[1][1], Some("B".into()));
+        assert_eq!(r.rows[2][1], Some("F".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn case_simple() {
+        setup();
+        execute("CREATE TABLE status (code INT)").unwrap();
+        execute("INSERT INTO status VALUES (1), (2), (3)").unwrap();
+        let r = execute(
+            "SELECT CASE code WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM status ORDER BY code"
+        ).unwrap();
+        assert_eq!(r.rows[0][0], Some("one".into()));
+        assert_eq!(r.rows[1][0], Some("two".into()));
+        assert_eq!(r.rows[2][0], Some("other".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn case_no_else_returns_null() {
+        setup();
+        execute("CREATE TABLE ce (x INT)").unwrap();
+        execute("INSERT INTO ce VALUES (1), (99)").unwrap();
+        let r = execute("SELECT CASE WHEN x = 1 THEN 'yes' END FROM ce ORDER BY x").unwrap();
+        assert_eq!(r.rows[0][0], Some("yes".into()));
+        assert_eq!(r.rows[1][0], None); // no ELSE → NULL
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn case_in_where() {
+        setup();
+        execute("CREATE TABLE cw (x INT)").unwrap();
+        execute("INSERT INTO cw VALUES (1), (2), (3)").unwrap();
+        let r = execute(
+            "SELECT x FROM cw WHERE CASE WHEN x > 1 THEN true ELSE false END ORDER BY x"
+        ).unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("2".into()));
+        assert_eq!(r.rows[1][0], Some("3".into()));
+    }
+
+    // ── DISTINCT tests ──────────────────────────────────────────
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_basic() {
+        setup();
+        execute("CREATE TABLE dup (color TEXT)").unwrap();
+        execute("INSERT INTO dup VALUES ('red'), ('blue'), ('red'), ('green'), ('blue')").unwrap();
+        let r = execute("SELECT DISTINCT color FROM dup ORDER BY color").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("blue".into()));
+        assert_eq!(r.rows[1][0], Some("green".into()));
+        assert_eq!(r.rows[2][0], Some("red".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_with_null() {
+        setup();
+        execute("CREATE TABLE dup2 (x INT)").unwrap();
+        execute("INSERT INTO dup2 VALUES (1), (NULL), (2), (NULL), (1)").unwrap();
+        let r = execute("SELECT DISTINCT x FROM dup2 ORDER BY x").unwrap();
+        // PostgreSQL: NULL groups as one, ORDER BY puts NULLs last
+        // We should have 3 distinct values: 1, 2, NULL
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_multi_column() {
+        setup();
+        execute("CREATE TABLE dup3 (a INT, b TEXT)").unwrap();
+        execute("INSERT INTO dup3 VALUES (1, 'x'), (1, 'y'), (1, 'x'), (2, 'x')").unwrap();
+        let r = execute("SELECT DISTINCT a, b FROM dup3 ORDER BY a, b").unwrap();
+        assert_eq!(r.rows.len(), 3); // (1,x), (1,y), (2,x)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn like_escaped_percent() {
+        setup();
+        execute("CREATE TABLE like6 (s TEXT)").unwrap();
+        execute("INSERT INTO like6 VALUES ('100%'), ('100x'), ('100')").unwrap();
+        let r = execute(r#"SELECT s FROM like6 WHERE s LIKE '100\%'"#).unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0], Some("100%".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_with_limit() {
+        setup();
+        execute("CREATE TABLE dup5 (x INT)").unwrap();
+        execute("INSERT INTO dup5 VALUES (1), (1), (2), (2), (3), (3)").unwrap();
+        // DISTINCT first (3 unique), then LIMIT 2
+        let r = execute("SELECT DISTINCT x FROM dup5 ORDER BY x LIMIT 2").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn distinct_preserves_order() {
+        setup();
+        execute("CREATE TABLE dup4 (x INT)").unwrap();
+        execute("INSERT INTO dup4 VALUES (3), (1), (2), (1), (3)").unwrap();
+        let r = execute("SELECT DISTINCT x FROM dup4 ORDER BY x").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0][0], Some("1".into()));
+        assert_eq!(r.rows[1][0], Some("2".into()));
+        assert_eq!(r.rows[2][0], Some("3".into()));
     }
 }
